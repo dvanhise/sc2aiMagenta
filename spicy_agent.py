@@ -1,30 +1,3 @@
-
-# Inputs:
-#  Feature map of enemy and friendly unit health/dps/speed
-
-# Outputs:
-#  List of actions and corresponsing predicted win probabilities for that action
-#
-
-# Define a sub-layer of the network, work backwards to determing ideal number of copies of it in the hidden layer
-#  Cov-net to same size
-
-# Action is [2+maxargs x max actions] matrix of probabilities
-# Another part of the out matrix is the arguments which may not get used
-#
-"""
-probability      action      arg1   arg2   arg3   ...
-probability2     action      arg1   arg2   arg3   ...
-probability3     action      arg1   arg2   arg3   ...
-...
-"""
-# Only action type is filtered through LSTM?
-
-# How do I give feedback for individual actions?
-# How do I use the game result [+1, -1]?  Do I use it against every action taken that game?
-# Does that mean I have to save the input and output at every step?
-
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -43,7 +16,6 @@ class SpicyAgent:
         actions.FUNCTIONS.no_op.id,
         actions.FUNCTIONS.select_point.id,
         actions.FUNCTIONS.select_rect.id,
-        # actions.FUNCTIONS.select_control_group.id,
         actions.FUNCTIONS.select_unit.id,
         actions.FUNCTIONS.select_army.id,
         actions.FUNCTIONS.Attack_screen.id,
@@ -63,13 +35,17 @@ class SpicyAgent:
     REWARD_SCALING = 100
 
     # Map subset
-    MIN_X = 22
-    MAX_X = 44
-    HEIGHT_X = MAX_X - MIN_X
+    MIN_X = 21
+    MAX_X = 43
+    SCREEN_SIZE = 64
 
-    MIN_Y = 20
-    MAX_Y = 36
-    HEIGHT_Y = MAX_Y - MIN_Y
+    MIN_Y = 21
+    MAX_Y = 43
+
+    SCREEN_DEPTH = 7
+    MAX_ARGS = 4
+
+    UNIT_LENGTH = 7
 
     def __init__(self, model=None):
         self.reward = 0
@@ -82,7 +58,7 @@ class SpicyAgent:
         self.storage = []
 
         if not model:
-            self.model = SpicyModel()
+            self.model = SpicyModel(self.SCREEN_SIZE, self.SCREEN_DEPTH, len(self.action_options)+self.MAX_ARGS)
         else:
             self.model = model
 
@@ -99,30 +75,30 @@ class SpicyAgent:
         self.steps += 1
         self.reward += obs.reward
 
-        # Build input
-        inputs = np.empty((10, self.HEIGHT_X, self.HEIGHT_Y))
+        # Build inputs
+        screens_input = np.empty((self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE), dtype=np.float32)
+        for ndx, name in enumerate(['player_id', 'player_relative', 'unit_type', 'selected', 'hit_points',
+                                    'unit_density', 'unit_density_aa']):
+            screens_input[ndx] = np.array(obs.observation['screen'][name])
 
-        # Add screens
-        inputs[0] = np.array(obs.observation['screen'], dtype=np.float32)
-        '''
-        obs.observation['screen'][1]
-        
-        Layers:
-        7 screens: player_id, player_relative, unit_type, selected, hit_points, unit_density, unit_density_aa  (22, 16)
-        selected_unit or multi_select  (n,7)
-        available_actions
-        last_action
-        '''
+        multi_select = np.array(obs.observation['multi_select'], dtype=np.float32)[:10]
+        selected_input = np.pad(multi_select, (self.UNIT_LENGTH, 10))
 
-        output_actions, output_args = self.model.call(inputs, training=True)
+        available_actions_input = np.empty(len(self.action_options), dtype=np.float32)
+        available_actions = obs.observation['available_actions']
+        for ndx, act_id in enumerate(self.action_options):
+            available_actions_input[ndx] = (1.0 if act_id in available_actions else 0.0)
 
-        # Filter out unavailable actions
+        output_actions, output_args = self.model.call(screens_input, selected_input, available_actions_input)
+
+        # Filter out unavailable actions before choosing the best one
         # TODO: Do this the proper numpy way
         for ndx in range(len(output_actions)):
-            if ndx not in obs.observation['available_actions']:
+            if ndx not in available_actions:
                 output_actions[ndx] = 0.0
         action_id = self.action_options[np.argmax(output_actions)]
 
+        # Build action
         action_args = []
         iter_args = iter(output_args)
         for arg in actions.FUNCTIONS[action_id].args:
@@ -131,78 +107,19 @@ class SpicyAgent:
                                     next(iter_args) * (self.MAX_Y-self.MIN_Y) + self.MIN_Y])
             elif arg.name == 'minimap':
                 raise ('Unused function argument type: %s' % arg.name)
-            elif arg.name == 'queued':
+            elif arg.name in ['select_add', 'queued', 'select_point_act']:
                 action_args.append([0])
             else:
                 raise('Unknown function argument type: %s' % arg.name)
 
         # TODO: Add LSTM for the action
         
-        self.storage.append((inputs, output_actions, output_args))
+        self.storage.append((screens_input, selected_input, available_actions_input, output_actions, output_args))
         return actions.FunctionCall(action_id, action_args)
 
-    def build_model(self, reuse, dev, ntype):
-        with tf.variable_scope(self.name) and tf.device(dev):
-            if reuse:
-                tf.get_variable_scope().reuse_variables()
-                assert tf.get_variable_scope().reuse
-
-            # Set inputs of networks
-            self.screen = tf.placeholder(tf.float32, [None, U.screen_channel(), self.ssize, self.ssize], name='screen')
-            self.info = tf.placeholder(tf.float32, [None, self.isize], name='info')
-
-            # Build networks
-            net = build_net(self.minimap, self.screen, self.info, self.msize, self.ssize, len(actions.FUNCTIONS), ntype)
-            self.spatial_action, self.non_spatial_action, self.value = net
-
-            # Set targets and masks
-            self.valid_spatial_action = tf.placeholder(tf.float32, [None], name='valid_spatial_action')
-            self.spatial_action_selected = tf.placeholder(tf.float32, [None, self.ssize ** 2],
-                                                          name='spatial_action_selected')
-            self.valid_non_spatial_action = tf.placeholder(tf.float32, [None, len(actions.FUNCTIONS)],
-                                                           name='valid_non_spatial_action')
-            self.non_spatial_action_selected = tf.placeholder(tf.float32, [None, len(actions.FUNCTIONS)],
-                                                              name='non_spatial_action_selected')
-            self.value_target = tf.placeholder(tf.float32, [None], name='value_target')
-
-            # Compute log probability
-            spatial_action_prob = tf.reduce_sum(self.spatial_action * self.spatial_action_selected, axis=1)
-            spatial_action_log_prob = tf.log(tf.clip_by_value(spatial_action_prob, 1e-10, 1.))
-            non_spatial_action_prob = tf.reduce_sum(self.non_spatial_action * self.non_spatial_action_selected, axis=1)
-            valid_non_spatial_action_prob = tf.reduce_sum(self.non_spatial_action * self.valid_non_spatial_action,
-                                                          axis=1)
-            valid_non_spatial_action_prob = tf.clip_by_value(valid_non_spatial_action_prob, 1e-10, 1.)
-            non_spatial_action_prob = non_spatial_action_prob / valid_non_spatial_action_prob
-            non_spatial_action_log_prob = tf.log(tf.clip_by_value(non_spatial_action_prob, 1e-10, 1.))
-            self.summary.append(tf.summary.histogram('spatial_action_prob', spatial_action_prob))
-            self.summary.append(tf.summary.histogram('non_spatial_action_prob', non_spatial_action_prob))
-
-            # Compute losses, more details in https://arxiv.org/abs/1602.01783
-            # Policy loss and value loss
-            action_log_prob = self.valid_spatial_action * spatial_action_log_prob + non_spatial_action_log_prob
-            advantage = tf.stop_gradient(self.value_target - self.value)
-            policy_loss = - tf.reduce_mean(action_log_prob * advantage)
-            value_loss = - tf.reduce_mean(self.value * advantage)
-            self.summary.append(tf.summary.scalar('policy_loss', policy_loss))
-            self.summary.append(tf.summary.scalar('value_loss', value_loss))
-
-            # TODO: policy penalty
-            loss = policy_loss + value_loss
-
-            # Build the optimizer
-            self.learning_rate = tf.placeholder(tf.float32, None, name='learning_rate')
-            opt = tf.train.RMSPropOptimizer(self.learning_rate, decay=0.99, epsilon=1e-10)
-            grads = opt.compute_gradients(loss)
-            cliped_grad = []
-            for grad, var in grads:
-                self.summary.append(tf.summary.histogram(var.op.name, var))
-                self.summary.append(tf.summary.histogram(var.op.name + '/grad', grad))
-                grad = tf.clip_by_norm(grad, 10.0)
-                cliped_grad.append([grad, var])
-            self.train_op = opt.apply_gradients(cliped_grad)
-            self.summary_op = tf.summary.merge(self.summary)
-
-            self.saver = tf.train.Saver(max_to_keep=100)
+    def train(self, reward):
+        # TODO: do_a_train(inputs, outputs, reward)
+        pass
 
     def calc_reward(self, obs, game_result):
 

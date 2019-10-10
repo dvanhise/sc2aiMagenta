@@ -19,7 +19,7 @@ from spicy_agent import SpicyAgent
 
 FLAGS = flags.FLAGS
 
-point_flag.DEFINE_point("feature_screen_size", "84",
+point_flag.DEFINE_point("feature_screen_size", "64",
                         "Resolution for screen feature layers.")
 point_flag.DEFINE_point("feature_minimap_size", "64",
                         "Resolution for minimap feature layers.")
@@ -42,7 +42,7 @@ flags.DEFINE_integer("parallel", 1, "How many instances to run in parallel.")
 
 flags.DEFINE_bool("save_replay", True, "Whether to save a replay at the end.")
 
-flags.DEFINE_string("map", None, "Name of a map to use.")
+flags.DEFINE_string("map", "maps/CodeMagenta.SC2Map", "Name of a map to use.")
 flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
 flags.mark_flag_as_required("map")
 
@@ -79,7 +79,7 @@ def run(players, map_name, visualize):
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
                 rewards = run_scenario_loop([player1, player2], env, FLAGS.max_agent_steps)
 
-                # TODO: Train agents
+                # TODO: Train agents from results
 
 
 def run_scenario_loop(agents, env, max_frames=0):
