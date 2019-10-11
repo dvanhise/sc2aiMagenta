@@ -15,6 +15,7 @@ from pysc2.lib import point_flag
 from pysc2.lib import stopwatch
 
 from spicy_agent import SpicyAgent
+from maps import MapCM, MapCMI
 
 
 FLAGS = flags.FLAGS
@@ -34,7 +35,9 @@ flags.DEFINE_bool("use_feature_units", False,
                   "Whether to include feature units.")
 flags.DEFINE_bool("use_raw_units", False,
                   "Whether to include raw units.")
-flags.DEFINE_bool("disable_fog", False, "Whether to disable Fog of War.")
+flags.DEFINE_bool("disable_fog", True, "Whether to disable Fog of War.")
+flags.DEFINE_integer("step_mul", 8, "Game steps per agent step.")
+flags.DEFINE_integer("game_steps_per_episode", None, "Game steps per episode.")
 
 flags.DEFINE_bool("profile", False, "Whether to turn on code profiling.")
 flags.DEFINE_bool("trace", False, "Whether to trace the code execution.")
@@ -42,7 +45,7 @@ flags.DEFINE_integer("parallel", 1, "How many instances to run in parallel.")
 
 flags.DEFINE_bool("save_replay", True, "Whether to save a replay at the end.")
 
-flags.DEFINE_string("map", "maps/CodeMagenta.SC2Map", "Name of a map to use.")
+flags.DEFINE_string("map", "CodeMagentaIsland", "Name of a map to use.")
 flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
 flags.mark_flag_as_required("map")
 
@@ -77,12 +80,14 @@ def run(players, map_name, visualize):
         for generation in count(1):
             # Full round robin
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
-                rewards = run_scenario_loop([player1, player2], env, FLAGS.max_agent_steps)
+                player1.reset()
+                player2.reset()
+                rewards = run_scenario_loop([player1, player2], env)
 
                 # TODO: Train agents from results
 
 
-def run_scenario_loop(agents, env, max_frames=0):
+def run_scenario_loop(agents, env):
     total_frames = 0
     start_time = time.time()
     rewards = [0.0, 0.0]
@@ -97,7 +102,7 @@ def run_scenario_loop(agents, env, max_frames=0):
         total_frames += 1
         actions = [agent.step(timestep) for agent, timestep in zip(agents, timesteps)]
         if timesteps[0].last():
-            rewards = (agent.calc_reward(obs_spec) for agent, obs_spec in zip(agents, observation_spec))
+            rewards = (agent.calc_reward(timestep) for agent, timestep in zip(agents, timesteps))
             break
         timesteps = env.step(actions)
 
@@ -118,11 +123,17 @@ def main(unused_argv):
         sc2_env.Agent(sc2_env.Race['terran'], 'player2')
     ]
 
-    run(players, FLAGS.map, False)
+    run(players, FLAGS.map, visualize=True)
 
     if FLAGS.profile:
         print(stopwatch.sw)
 
 
 if __name__ == "__main__":
+    # Register maps
+    MapCM()
+    MapCMI()
+    globals()['CodeMagenta'] = type('CodeMagenta', (MapCM,), dict(filename='CodeMagenta'))
+    globals()['CodeMagentaIsland'] = type('CodeMagentaIsland', (MapCMI,), dict(filename='CodeMagentaIsland'))
+
     app.run(main)
