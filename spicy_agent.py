@@ -44,14 +44,16 @@ class SpicyAgent:
         # 'control_group_act': 6,
     }
 
-    REWARD_SCALING = 100
-
     SCREEN_SIZE = 64
     SCREEN_DEPTH = 9  # Number of screen views to use
 
     ARG_COUNT = 8  # Size of arg tensor
 
     UNIT_LENGTH = 7  # Length of unit tensor
+
+    LEARNING_RATE = .0001
+    DISCOUNT_RATE = .9
+    VESPENE_SCALING = 1.5
 
     def __init__(self, model=None):
         self.reward = 0
@@ -65,9 +67,6 @@ class SpicyAgent:
 
         if not model:
             self.model = SpicyModel(self.SCREEN_SIZE, self.SCREEN_DEPTH, len(self.action_options), self.ARG_COUNT)
-            self.model.compile(optimizer=tf.keras.optimizers.RMSprop(0.001),
-              loss='categorical_crossentropy',
-              metrics=['accuracy'])
         else:
             self.model = model
 
@@ -90,27 +89,18 @@ class SpicyAgent:
             return actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
             # return actions.FunctionCall(actions.FUNCTIONS.move_camera.id, [32, 32])
 
-        # Build and preprocess inputs
-        screens_input = np.zeros((self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE), dtype=np.float32)
-        for ndx, name in enumerate(['player_id', 'player_relative', 'unit_type', 'selected', 'unit_hit_points',
-                                    'unit_hit_points_ratio', 'active', 'unit_density', 'unit_density_aa']):
-            screens_input[ndx] = np.array(obs.observation['feature_screen'][name])
-        screens_input = screens_input.T
-        screens_input = np.reshape(screens_input, (1, self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE))
+        screens_input, selected_input, available_actions_input = self.build_inputs_from_obs(obs)
 
-        selected_input = np.zeros((self.UNIT_LENGTH, 10), dtype=np.float32)
-        multi_select = np.array(obs.observation['multi_select'], dtype=np.float32)[:10]
-        selected_input[0:multi_select.shape[0], 0:multi_select.shape[1]] = multi_select
-        selected_input = np.reshape(selected_input, (1, self.UNIT_LENGTH, 10))
-
-        available_actions_input = np.zeros(len(self.action_options), dtype=np.float32)
-        available_actions = obs.observation['available_actions']
-        for ndx, act_id in enumerate(self.action_options):
-            available_actions_input[ndx] = (1. if act_id in available_actions else 0.)
-        available_actions_input = np.reshape(available_actions_input, (1, len(self.action_options)))
-
-        print('Input Shapes: %s -- %s -- %s' % (screens_input.shape, selected_input.shape, available_actions_input.shape))
+        # print('Input Shapes: %s -- %s -- %s' % (screens_input.shape, selected_input.shape, available_actions_input.shape))
         output_actions, output_args = self.model.call(screens_input, selected_input, available_actions_input)
+
+        # Add gaussian noise to action tensor
+        output_actions += np.random.normal(scale=.05, size=output_actions.shape)
+
+        # Clip the values to 1
+        #   I don't think I should need to do this with sigmoid activation functions, yet I get errors
+        output_actions = np.clip(output_actions, -.000001, .9999999)
+        output_args = np.clip(output_args, None, .9999999)
 
         # Turn everything back to numpy so not funny business happens
         output_args = np.array(output_args).T
@@ -121,9 +111,9 @@ class SpicyAgent:
         # Filter out unavailable actions before choosing the best one
         # TODO: Do this the proper numpy way
         for ndx in range(len(output_actions)):
-            if self.action_options[ndx] not in available_actions:
+            if self.action_options[ndx] not in obs.observation['available_actions']:
                 output_actions[ndx] = 0.0
-        action_id = self.action_options[np.argmax(output_actions)]
+        action_id = self.action_options[int(np.argmax(output_actions))]
 
         # Build action
         action_args = []
@@ -133,7 +123,7 @@ class SpicyAgent:
                 y = output_args[self.arg_options['screen'] + 1]
                 action_args.append([math.floor(x * self.SCREEN_SIZE), math.floor(y * self.SCREEN_SIZE)])
                 if x > 1 or y > 1:
-                    print('This is the problem: x=%f, y=%f' % (x,y))
+                    print('This is the problem: x=%f, y=%f' % (x, y))
             elif arg.name == 'screen2':
                 x = output_args[self.arg_options['screen2']]
                 y = output_args[self.arg_options['screen2'] + 1]
@@ -162,28 +152,43 @@ class SpicyAgent:
         print("Action: %d, Args: %s" % (action_id, action_args))
         return actions.FunctionCall(action_id, action_args)
 
-    def train(self, reward):
-        # Choo Choo!
-        # TODO: do_a_train(inputs, outputs, reward)
-        print('Training started for agent')
+    # agent.update(replay_buffer, FLAGS.discount, learning_rate, counter)
+    def update(self, replay_buffer, discount_rate, learning_rate, action_counter):
+        pass
 
-    def calc_reward(self, obs, game_result):
+    def build_inputs_from_obs(self, obs):
+        screens_input = np.zeros((self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE), dtype=np.float32)
+        for ndx, name in enumerate(['player_id', 'player_relative', 'unit_type', 'selected', 'unit_hit_points',
+                                    'unit_hit_points_ratio', 'active', 'unit_density', 'unit_density_aa']):
+            screens_input[ndx] = np.array(obs.observation['feature_screen'][name])
+        screens_input = screens_input.T
+        screens_input = np.reshape(screens_input, (1, self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE))
 
-        # TODO: Use these for better reward scores
-        # score_by_category
-        # killed_minerals = 1
-        # killed_vespene = 2
-        # lost_minerals = 3
-        # lost_vespene = 4
+        selected_input = np.zeros((self.UNIT_LENGTH, 10), dtype=np.float32)
+        multi_select = np.array(obs.observation['multi_select'], dtype=np.float32)[:10]
+        selected_input[0:multi_select.shape[0], 0:multi_select.shape[1]] = multi_select
+        selected_input = np.reshape(selected_input, (1, self.UNIT_LENGTH, 10))
 
-        killed_value_units = obs.observation['score_cumulative'][5]
-        total_damage_dealt = obs.observation['score_by_vital'][0]
-        total_damage_taken = obs.observation['score_by_vital'][1]
+        available_actions_input = np.zeros(len(self.action_options), dtype=np.float32)
+        available_actions = obs.observation['available_actions']
+        for ndx, act_id in enumerate(self.action_options):
+            available_actions_input[ndx] = (1. if act_id in available_actions else 0.)
+        available_actions_input = np.reshape(available_actions_input, (1, len(self.action_options)))
 
-        reward = game_result/2 + \
-            .25 * np.tanh(killed_value_units / self.REWARD_SCALING) + \
-            .25 * np.tanh(total_damage_dealt / self.REWARD_SCALING) - \
-            .25 * np.tanh(total_damage_taken / self.REWARD_SCALING)
+        return screens_input, selected_input, available_actions_input
 
+    def calc_reward(self, obs, obs_prev):
+        score = obs.observation['score_by_category']
+        score_prev = obs_prev.observation['score_by_category']
+        # Difference in killed minerals and vespene - diff in lost minerals and vespene since last state
+        diff_value_lost = (score[1] - score_prev[1]) + self.VESPENE_SCALING*(score[2] - score_prev[2]) - \
+                          (score[3] - score_prev[3]) + self.VESPENE_SCALING*(score[4] - score_prev[4])
+
+        score = obs.observation['score_by_vital']
+        score_prev = obs.observation['score_by_vital']
+        # Damage taken - damage dealt since last state
+        diff_damage_done = (score[0] - score_prev[0]) - (score[1] - score_prev[1])
+
+        reward = diff_value_lost + .5*diff_damage_done
         print('Agent reward: %.3f' % reward)
         return reward

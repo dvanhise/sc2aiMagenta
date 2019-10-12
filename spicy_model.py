@@ -31,7 +31,7 @@ class SpicyModel(tf.keras.Model):
         self.combined_flatten = Flatten()
 
         self.args_dense = Dense(dim_args, use_bias=True, activation='sigmoid')
-        self.act_probs_dense = Dense(dim_acts, use_bias=True, activation='sigmoid')
+        self.act_probs_dense = Dense(dim_acts, use_bias=True, activation='softmax')
 
     def call(self, screen, selected, available_actions):
         # screen -> conv+maxpool -> conv+maxpool -> concat -> dense -> dense -> arguments

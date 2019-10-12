@@ -4,6 +4,7 @@ from __future__ import print_function
 
 import time
 from itertools import count, combinations
+import numpy as np
 
 from absl import app
 from absl import flags
@@ -74,41 +75,49 @@ def run(players, map_name, visualize):
         env = available_actions_printer.AvailableActionsPrinter(env)
 
         agents = [SpicyAgent() for _ in range(AGENT_COUNT)]
-        # TODO: Try loading agent from file first
 
-        # TODO: Add keyboard interupt handling for play loop
-        for generation in count(1):
+        for _ in count(1):
             # Full round robin
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
                 player1.reset()
                 player2.reset()
-                rewards = run_scenario_loop([player1, player2], env)
 
-                # TODO: Train agents from results
+                # 16 steps = 1 second of game time, running 1 frame every 8 steps, is 2 frames per second
+                # End right before scenario timer or it sometimes crashes
+                run_scenario_loop([player1, player2], env, max_frames=2*119)
 
 
-def run_scenario_loop(agents, env):
+def run_scenario_loop(agents, env, max_frames=0):
     total_frames = 0
     start_time = time.time()
-    rewards = [0.0, 0.0]
 
     observation_spec = env.observation_spec()
     action_spec = env.action_spec()
     for agent, obs_spec, act_spec in zip(agents, observation_spec, action_spec):
         agent.setup(obs_spec, act_spec)
 
-    timesteps = env.reset()
+    done = False
+    rewards_total = (0., 0.)
+    states = env.reset()
+    Q = np.zeros([1100101010, 10])  # states x actions
     while True:
         total_frames += 1
-        actions = [agent.step(timestep) for agent, timestep in zip(agents, timesteps)]
-        if timesteps[0].last():
-            rewards = (agent.calc_reward(timestep) for agent, timestep in zip(agents, timesteps))
+        actions = [agent.step(state) for agent, state in zip(agents, states)]
+
+        prev_states = states
+        states = env.step(actions)
+        rewards = [agent.calc_reward(state, prev_state) for agent, state, prev_state in zip(agents, states, prev_states)]
+        done = states[0].last() or (max_frames and total_frames >= max_frames)
+
+        # Update Q table
+
+        rewards_total = [rt + r for rt, r in zip(rewards_total, rewards)]
+
+        if done:
             break
-        timesteps = env.step(actions)
 
     elapsed_time = time.time() - start_time
     print("Took %.3f seconds at %.3f fps" % (elapsed_time, total_frames / elapsed_time))
-    return rewards
 
 
 def main(unused_argv):
