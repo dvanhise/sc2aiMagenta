@@ -5,6 +5,7 @@ from __future__ import print_function
 import time
 from itertools import count, combinations
 import numpy as np
+import tensorflow as tf
 
 from absl import app
 from absl import flags
@@ -74,6 +75,7 @@ def run(players, map_name, visualize):
             visualize=visualize) as env:
         env = available_actions_printer.AvailableActionsPrinter(env)
 
+        # Initialize agents
         agents = [SpicyAgent() for _ in range(AGENT_COUNT)]
 
         for _ in count(1):
@@ -91,10 +93,13 @@ def run_scenario_loop(agents, env, max_frames=0):
     total_frames = 0
     start_time = time.time()
 
+    config = tf.ConfigProto(allow_soft_placement=True)
+    sessions = (tf.Session(config=config) for _ in agents)
+
     observation_spec = env.observation_spec()
     action_spec = env.action_spec()
-    for agent, obs_spec, act_spec in zip(agents, observation_spec, action_spec):
-        agent.setup(obs_spec, act_spec)
+    for agent, sess, obs_spec, act_spec in zip(agents, sessions, observation_spec, action_spec):
+        agent.setup(sess, obs_spec, act_spec)
 
     done = False
     rewards_total = (0., 0.)
@@ -111,11 +116,15 @@ def run_scenario_loop(agents, env, max_frames=0):
 
         # Update Q table
 
+        Q1 = sess.run(Qout, feed_dict={inputs1: np.identity(16)[s1:s1 + 1]})
+
         rewards_total = [rt + r for rt, r in zip(rewards_total, rewards)]
 
         if done:
             break
 
+    for sess in sessions:
+        sess.close()
     elapsed_time = time.time() - start_time
     print("Took %.3f seconds at %.3f fps" % (elapsed_time, total_frames / elapsed_time))
 

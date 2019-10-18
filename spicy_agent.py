@@ -4,12 +4,15 @@ from __future__ import print_function
 
 from pysc2.lib import actions
 from pysc2.lib import units
+from pysc2.lib import features
 import numpy as np
 import tensorflow as tf
 import math
 
 from spicy_model import SpicyModel
 
+
+# Perpetual motion device with an immovable rod?
 
 class SpicyAgent:
 
@@ -28,6 +31,7 @@ class SpicyAgent:
     ]
 
     unit_options = [
+        None,
         units.Terran.Marine,
         units.Terran.Marauder,
         units.Terran.Hellion
@@ -49,11 +53,13 @@ class SpicyAgent:
 
     ARG_COUNT = 8  # Size of arg tensor
 
-    UNIT_LENGTH = 7  # Length of unit tensor
+    UNIT_TENSOR_LENGTH = 3
 
-    LEARNING_RATE = .0001
+    LEARNING_RATE = .2
     DISCOUNT_RATE = .9
+    EXPLORATION_RATE = .3
     VESPENE_SCALING = 1.5
+    UNIT_HP_SCALE = 200  # 1600 by default
 
     def __init__(self, model=None):
         self.reward = 0
@@ -61,6 +67,8 @@ class SpicyAgent:
         self.steps = 0
         self.obs_spec = None
         self.action_spec = None
+        self.sess = None
+        self.player_id = 0
 
         # (input, output) tuples for the current scenario
         self.storage = []
@@ -70,17 +78,42 @@ class SpicyAgent:
         else:
             self.model = model
 
+        # How to convert blizzard unit and building IDs to our subset of units
+        def convert_unit_ids(x):
+            if x in self.unit_options:
+                return self.unit_options.index(x) / len(self.unit_options)
+            return self.unit_options.index(None) / len(self.unit_options)
+        self.convert_unit_ids = convert_unit_ids
+        self.convert_unit_ids_vect = np.vectorize(convert_unit_ids)
+
+        # def convert_player_ids(x):
+        #     if x == self.player_id:
+        #         return 0.
+        #     else:
+        #         return 1.
+        def convert_player_ids(x):
+            if x == 3:
+                return 0.
+            elif x == 5:
+                return 1.
+            else:
+                raise ValueError('That should not happen')
+        self.convert_player_ids = convert_player_ids
+        self.convert_player_ids_vect = np.vectorize(convert_player_ids)
+
         # self.model.summary()  # Print model architecture
 
-    def setup(self, obs_spec, action_spec):
+    def setup(self, sess, obs_spec, action_spec):
         self.obs_spec = obs_spec
         self.action_spec = action_spec
+        self.sess = sess
 
     def reset(self):
         self.storage = []
         self.steps = 0
         self.episodes += 1
 
+    # Takes a state and returns an action, also updates step information
     def step(self, obs):
         self.steps += 1
         self.reward += obs.reward
@@ -95,7 +128,7 @@ class SpicyAgent:
         output_actions, output_args = self.model.call(screens_input, selected_input, available_actions_input)
 
         # Add gaussian noise to action tensor
-        output_actions += np.random.normal(scale=.05, size=output_actions.shape)
+        output_actions += np.random.normal(scale=.1, size=output_actions.shape)
 
         # Clip the values to 1
         #   I don't think I should need to do this with sigmoid activation functions, yet I get errors
@@ -152,22 +185,40 @@ class SpicyAgent:
         print("Action: %d, Args: %s" % (action_id, action_args))
         return actions.FunctionCall(action_id, action_args)
 
-    # agent.update(replay_buffer, FLAGS.discount, learning_rate, counter)
     def update(self, replay_buffer, discount_rate, learning_rate, action_counter):
         pass
 
     def build_inputs_from_obs(self, obs):
+
+        screens = ['player_relative', 'unit_type', 'selected', 'unit_hit_points',
+                   'unit_hit_points_ratio', 'active', 'unit_density', 'unit_density_aa']
+
         screens_input = np.zeros((self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE), dtype=np.float32)
-        for ndx, name in enumerate(['player_id', 'player_relative', 'unit_type', 'selected', 'unit_hit_points',
-                                    'unit_hit_points_ratio', 'active', 'unit_density', 'unit_density_aa']):
-            screens_input[ndx] = np.array(obs.observation['feature_screen'][name])
+        for ndx, name in enumerate(screens):
+            if name == 'player_relative':
+                screens_input[ndx] = self.convert_player_ids_vect(np.array(obs.observation['feature_screen'][name]))
+            elif name == 'unit_type':
+                unit_types = np.array(obs.observation['feature_screen'][name])
+                screens_input[ndx] = self.convert_unit_ids_vect(unit_types)
+            elif name == 'unit_hit_points':
+                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]) / self.UNIT_HP_SCALE
+            else:
+                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]) / features.SCREEN_FEATURES[name].scale
+
         screens_input = screens_input.T
         screens_input = np.reshape(screens_input, (1, self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE))
 
-        selected_input = np.zeros((self.UNIT_LENGTH, 10), dtype=np.float32)
-        multi_select = np.array(obs.observation['multi_select'], dtype=np.float32)[:10]
+        def convert_select_tensor(x):
+            return np.array([
+                self.convert_unit_ids(x[0]),
+                self.convert_player_ids(x[1]),
+                x[2] / self.UNIT_HP_SCALE
+            ], dtype=np.float32)
+
+        selected_input = np.zeros((self.UNIT_TENSOR_LENGTH, 10), dtype=np.float32)
+        multi_select = np.array(convert_select_tensor(obs.observation['multi_select']), dtype=np.float32)[:10]
         selected_input[0:multi_select.shape[0], 0:multi_select.shape[1]] = multi_select
-        selected_input = np.reshape(selected_input, (1, self.UNIT_LENGTH, 10))
+        selected_input = np.reshape(selected_input, (1, self.UNIT_TENSOR_LENGTH, 10))
 
         available_actions_input = np.zeros(len(self.action_options), dtype=np.float32)
         available_actions = obs.observation['available_actions']
@@ -178,6 +229,9 @@ class SpicyAgent:
         return screens_input, selected_input, available_actions_input
 
     def calc_reward(self, obs, obs_prev):
+        if obs.last():
+            return 0.
+
         score = obs.observation['score_by_category']
         score_prev = obs_prev.observation['score_by_category']
         # Difference in killed minerals and vespene - diff in lost minerals and vespene since last state
