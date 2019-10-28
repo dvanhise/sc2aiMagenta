@@ -79,6 +79,7 @@ def run(players, map_name, visualize):
         agents = [SpicyAgent() for _ in range(AGENT_COUNT)]
 
         for _ in count(1):
+
             # Full round robin
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
                 player1.reset()
@@ -86,7 +87,12 @@ def run(players, map_name, visualize):
 
                 # 16 steps = 1 second of game time, running 1 frame every 8 steps, is 2 frames per second
                 # End right before scenario timer or it sometimes crashes
+                print('>>> Start game loop')
                 run_scenario_loop([player1, player2], env, max_frames=2*119)
+
+                print('>>> Train agents')
+                player1.train()
+                player2.train()
 
 
 def run_scenario_loop(agents, env, max_frames=0):
@@ -101,26 +107,12 @@ def run_scenario_loop(agents, env, max_frames=0):
     for agent, sess, obs_spec, act_spec in zip(agents, sessions, observation_spec, action_spec):
         agent.setup(sess, obs_spec, act_spec)
 
-    done = False
-    rewards_total = (0., 0.)
     states = env.reset()
-    Q = np.zeros([1100101010, 10])  # states x actions
     while True:
         total_frames += 1
         actions = [agent.step(state) for agent, state in zip(agents, states)]
-
-        prev_states = states
         states = env.step(actions)
-        rewards = [agent.calc_reward(state, prev_state) for agent, state, prev_state in zip(agents, states, prev_states)]
-        done = states[0].last() or (max_frames and total_frames >= max_frames)
-
-        # Update Q table
-
-        Q1 = sess.run(Qout, feed_dict={inputs1: np.identity(16)[s1:s1 + 1]})
-
-        rewards_total = [rt + r for rt, r in zip(rewards_total, rewards)]
-
-        if done:
+        if states[0].last() or (max_frames and total_frames >= max_frames):
             break
 
     for sess in sessions:

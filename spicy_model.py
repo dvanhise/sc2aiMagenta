@@ -1,9 +1,11 @@
 import tensorflow as tf
-from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape
+from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape, Input
+
+from tensorflow.keras.backend import placeholder
 
 
 class SpicyModel(tf.keras.Model):
-    def __init__(self, dim_map, dim_depth, dim_acts, dim_args):
+    def __init__(self, screen_width, screen_height, screen_depth, ns_input_length, action_size):
         super().__init__()
 
         # Inputs
@@ -11,50 +13,41 @@ class SpicyModel(tf.keras.Model):
         # select_input = tf.keras.Input(shape=(7, 10))
         # available_actions = tf.keras.Input(shape=(dim_acts,))
 
-        #  What is N?  Who's to know?
-        N = 32
+        self.screen_input = Input(shape=(screen_width, screen_height, screen_depth))
+        self.ns_input = Input(shape=(ns_input_length,))
 
-        self.conv1 = Conv2D(2*dim_depth, 3, padding='same', activation='relu',
-                            input_shape=(dim_depth, dim_map, dim_map))
-        self.conv2 = Conv2D(N, 3, padding='valid', activation='relu')
-        self.maxpool = MaxPooling2D()
-        self.screen_reshape = Reshape((15, 32))
+        self.conv1 = Conv2D(screen_depth, 5, strides=1, padding='same', activation='relu', input_shape=self.screen_input.shape)
+        self.conv2 = Conv2D(2*screen_depth, 3, strides=1, padding='same', activation='relu')
+        # self.maxpool = MaxPooling2D()
 
-        self.selected_dense = Dense(N, use_bias=True, activation='relu')
-        self.selected_reshape = Reshape((7, 32))
+        self.ns_dense = Dense(screen_width, use_bias=True, activation='relu')
 
-        self.avail_act_dense = Dense(N, use_bias=True, activation='relu')
-        self.avail_act_reshape = Reshape((1, 32))
+        self.concat = Concatenate(axis=2)
 
-        self.concat = Concatenate(axis=1)
-        self.combined_dense = Dense(N, use_bias=True, activation='relu')
-        self.combined_flatten = Flatten()
+        self.conv_out = Conv2D(1, 3, padding='same', activation='relu')
 
-        self.args_dense = Dense(dim_args, use_bias=True, activation='sigmoid')
-        self.act_probs_dense = Dense(dim_acts, use_bias=True, activation='sigmoid')
+        self.state_dense = Dense(256, use_bias=True, activation='relu')
+        self.ns_actions_out = Conv2D(action_size, 1, strides=1, padding='same')
+        self.value_out = Dense(1, use_bias=True)
 
-    def call(self, screen, selected, available_actions):
+
+    def call(self, screen, ns_data, training=False):
         # screen -> conv+maxpool -> conv+maxpool -> concat -> dense -> dense -> arguments
-        # selected -> dense -----------------------^ ^            \-> dense -> action probs
-        # available_actions -> dense ---------------/
+        # available_actions -> dense ---------------/             \-> dense -> action probs
 
         screen_conv = self.conv1(screen)
-        screen_conv = self.maxpool(screen_conv)
+        # screen_conv = self.maxpool(screen_conv)
         screen_conv = self.conv2(screen_conv)
-        screen_conv = self.maxpool(screen_conv)
-        screen_conv = self.screen_reshape(screen_conv)
+        # screen_conv = self.maxpool(screen_conv)
 
-        selected_part = self.selected_dense(selected)
-        selected_part = self.selected_reshape(selected_part)
+        ns = self.ns_dense(ns_data)
 
-        avail_act_part = self.avail_act_dense(available_actions)
-        avail_act_part = self.avail_act_reshape(avail_act_part)
+        state = self.concat([screen_conv, ns])
+        state_ns = self.state_dense(state)
 
-        concat = self.concat([screen_conv, selected_part, avail_act_part])
-        concat = self.combined_dense(concat)
-        split = self.combined_flatten(concat)
+        value = self.value_out(state_ns)
+        ns_action_policy = self.ns_actions_out(state_ns)
 
-        arguments = self.args_dense(split)
-        action_probs = self.act_probs_dense(split)
+        spacial_action_policy = self.conv_out(state)
 
-        return action_probs, arguments
+        return spacial_action_policy, ns_action_policy, value
