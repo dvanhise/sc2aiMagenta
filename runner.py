@@ -1,20 +1,13 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import time
 from itertools import count, combinations
-import numpy as np
-import tensorflow as tf
+from tensorflow.python.framework.ops import disable_eager_execution
 
 from absl import app
 from absl import flags
-from future.builtins import range  # pylint: disable=redefined-builtin
 
-from pysc2.env import available_actions_printer
-from pysc2.env import sc2_env
-from pysc2.lib import point_flag
-from pysc2.lib import stopwatch
+from pysc2.env import available_actions_printer, sc2_env
+from pysc2.lib import point_flag, stopwatch
+from pysc2.lib.protocol import ProtocolError
 
 from spicy_agent import SpicyAgent
 from maps import MapCM, MapCMI
@@ -52,7 +45,7 @@ flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
 flags.mark_flag_as_required("map")
 
 
-AGENT_COUNT = 3
+AGENT_COUNT = 4
 
 
 def run(players, map_name, visualize):
@@ -85,7 +78,7 @@ def run(players, map_name, visualize):
                 player1.reset()
                 player2.reset()
 
-                # 16 steps = 1 second of game time, running 1 frame every 8 steps, is 2 frames per second
+                # 16 steps = 1 second of game time, running 1 frame every 8 steps is 2 frames per second
                 # End right before scenario timer or it sometimes crashes
                 print('>>> Start game loop')
                 run_scenario_loop([player1, player2], env, max_frames=2*119)
@@ -99,29 +92,27 @@ def run_scenario_loop(agents, env, max_frames=0):
     total_frames = 0
     start_time = time.time()
 
-    config = tf.ConfigProto(allow_soft_placement=True)
-    sessions = (tf.Session(config=config) for _ in agents)
-
     observation_spec = env.observation_spec()
     action_spec = env.action_spec()
-    for agent, sess, obs_spec, act_spec in zip(agents, sessions, observation_spec, action_spec):
-        agent.setup(sess, obs_spec, act_spec)
+    for agent, obs_spec, act_spec in zip(agents, observation_spec, action_spec):
+        agent.setup(obs_spec, act_spec)
 
     states = env.reset()
     while True:
         total_frames += 1
         actions = [agent.step(state) for agent, state in zip(agents, states)]
         states = env.step(actions)
-        if states[0].last() or (max_frames and total_frames >= max_frames):
+
+        if states[0].last() or states[1].last() or (max_frames and total_frames >= max_frames):
             break
 
-    for sess in sessions:
-        sess.close()
     elapsed_time = time.time() - start_time
     print("Took %.3f seconds at %.3f fps" % (elapsed_time, total_frames / elapsed_time))
 
 
 def main(unused_argv):
+    SpicyAgent()
+
     """Run an agent."""
     if FLAGS.trace:
         stopwatch.sw.trace()
@@ -145,5 +136,7 @@ if __name__ == "__main__":
     MapCMI()
     globals()['CodeMagenta'] = type('CodeMagenta', (MapCM,), dict(filename='CodeMagenta'))
     globals()['CodeMagentaIsland'] = type('CodeMagentaIsland', (MapCMI,), dict(filename='CodeMagentaIsland'))
+
+    # disable_eager_execution()
 
     app.run(main)

@@ -1,16 +1,19 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 from pysc2.lib import actions
 from pysc2.lib import units
 from pysc2.lib import features
+
 import numpy as np
 import tensorflow as tf
-from spicy_config import *
+import tensorflow.keras.backend as K
+import tensorflow.keras.losses as KL
+from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape, Input
+from tensorflow.keras.optimizers import RMSprop
+from tensorflow.keras import Model
+
 import math
 
-from spicy_model import SpicyModel
+# from spicy_model import SpicyModel
+from spicy_config import *
 
 
 class SpicyAgent:
@@ -19,7 +22,6 @@ class SpicyAgent:
         actions.FUNCTIONS.no_op.id,
         actions.FUNCTIONS.select_point.id,
         actions.FUNCTIONS.select_rect.id,
-        # actions.FUNCTIONS.select_control_group.id,
         actions.FUNCTIONS.select_unit.id,
         actions.FUNCTIONS.select_army.id,
         actions.FUNCTIONS.Attack_screen.id,
@@ -30,13 +32,11 @@ class SpicyAgent:
     ]
 
     unit_options = [
-        None,
         units.Terran.Marine,
         units.Terran.Marauder,
         units.Terran.Hellion
     ]
 
-    # Available argument types and their offset in the arg tensor
     arg_options = [
         'select_unit_id',
         'select_add',
@@ -52,114 +52,102 @@ class SpicyAgent:
     UNIT_TENSOR_LENGTH = 3
 
     SELECT_SIZE = 3
-    MAX_UNIT_SELECT = 8
+    MAX_UNIT_SELECT = SCREEN_SIZE - len(action_options)
 
-    LEARNING_RATE = .2
-    DISCOUNT_RATE = .9
-    EXPLORATION_RATE = .3
     VESPENE_SCALING = 1.5
     UNIT_HP_SCALE = 200  # 1600 by default
 
-    def __init__(self, model=None):
+    def __init__(self):
         self.reward = 0
         self.episodes = 0
-        self.steps = -1
+        self.steps = 0
         self.obs_spec = None
         self.action_spec = None
-        self.sess = None
 
         self.recorder = []
 
-        if not model:
-            self.model = SpicyModel(self.SCREEN_SIZE, self.SCREEN_SIZE, self.SCREEN_DEPTH,
-                                    len(self.action_options) + self.MAX_UNIT_SELECT * self.SELECT_SIZE,
-                                    len(self.action_options) + len(self.arg_options))
-        else:
-            self.model = model
+        self.model = self.build_model(self.SCREEN_SIZE,
+                                      self.SCREEN_SIZE,
+                                      self.SCREEN_DEPTH,
+                                      self.UNIT_TENSOR_LENGTH,
+                                      len(self.action_options))
+        # self.model.summary()
+        self.opt = RMSprop(lr=LEARNING_RATE)
+
+        # Output placeholders
+        self.value_pl = K.placeholder(shape=(None,))
+        self.actual_value_pl = K.placeholder(shape=(None,))
+        self.advantage_pl = K.placeholder(shape=(None,))
+        self.reward_pl = K.placeholder(shape=(None,))
+        self.ns_policy_pl = K.placeholder(shape=(len(self.action_options), 3))
+        self.spatial_policy_pl = K.placeholder(shape=(self.SCREEN_SIZE, self.SCREEN_SIZE))
+
 
         # How to convert blizzard unit and building IDs to our subset of units
         def convert_unit_ids(x):
             if x in self.unit_options:
                 return self.unit_options.index(x) / len(self.unit_options)
-            return self.unit_options.index(None) / len(self.unit_options)
+            return 1.
         self.convert_unit_ids = convert_unit_ids
         self.convert_unit_ids_vect = np.vectorize(convert_unit_ids)
 
         # How to convert 'player_relative' data
         def convert_player_ids(x):
-            if x == 3:
-                return 0.
-            elif x == 5:
+            if x == 1:    # Self
                 return 1.
-            else:
-                raise ValueError('That should not happen')
+            elif x == 4:  # Enemy
+                return -1.
+            else:         # Background usually
+                return 0.
         self.convert_player_ids = convert_player_ids
         self.convert_player_ids_vect = np.vectorize(convert_player_ids)
 
-        self.graph = tf.Graph()
-        with self.graph.as_default():
-
-            value_target = tf.placeholder("float", [None])
-            global_step = tf.placeholder("int", [None])
-            screen_input = tf.placeholder("float", [self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE])
-            ns_input = tf.placeholder("float", [len(self.action_options) + self.MAX_UNIT_SELECT * self.SELECT_SIZE])
-
-            # spatial_action_policy, ns_action_policy, value = \
-            #     self.build_model(screen_input, ns_input, len(self.action_options) + len(self.arg_options))
-
-            spatial_action_policy, ns_action_policy, value = self.model.call(screen_input, ns_input)
-
-            action_probs, action_args = tf.split(ns_action_policy, [len(self.action_options), len(self.arg_options)])
-
-            optimizer = tf.train.RMSPropOptimizer(learning_rate=LEARNING_RATE, decay=DECAY_RATE)
-
-            entropy = tf.reduce_sum(ns_action_policy * tf.log(ns_action_policy) *
-                                    spatial_action_policy * tf.log(spatial_action_policy))
-            advantage = value_target - value
-
-            # Is policy loss correct here?  Why is there a negative?
-            p_loss = -tf.reduce_sum(tf.log(action_probs) * tf.log(spatial_action_policy) * advantage)
-            v_loss = tf.reduce_mean(tf.square(advantage))
-            total_loss = p_loss + v_loss - entropy*ENTROPY_RATE
-
-            optimizer.minimize(total_loss, global_step=global_step)
-
-    def setup(self, sess, obs_spec, action_spec):
+    def setup(self, obs_spec, action_spec):
         self.obs_spec = obs_spec
         self.action_spec = action_spec
-        self.sess = sess
 
     def reset(self):
         self.recorder = []
-        self.steps = -1
+        self.steps = 0
         self.episodes += 1
 
+    # Uses the experience from recorded data to train model
     def train(self):
-        total_value_loss = 0
-        total_policy_loss = 0
+        # TODO: Only look at action probability part of ns_policy
+        discounted_reward = 0
+        for state in reversed(self.recorder):
+            if not state.done:
+                discounted_reward = np.float32(state.reward + DISCOUNT_RATE * discounted_reward)
+                self.train_one_step(state.inputs, discounted_reward)
 
-        with tf.Session(graph=self.graph) as session:
-            tf.global_variables_initializer().run()
+        print('Training round complete')
 
-            value_target = 0
-            for state in reversed(self.recorder):
-                value_target = state.reward + DISCOUNT_RATE * value_target
+    # @tf.function
+    def train_one_step(self, inputs, reward):
+        with tf.GradientTape() as tape:
+            spatial_policy, ns_policy, value = self.model(inputs)
+            value_loss = KL.mean_squared_error(value, reward)
 
-                feed_dict = {
-                    'value_target': value_target,
-                    'global_step': self.episodes,
-                    'screen_input': state.inputs['spatial'],
-                    'ns_input': state.inputs['nonspatial']
-                }
-                _, p_loss, v_loss, entropy = session.run(feed_dict=feed_dict)
-                total_policy_loss += p_loss
-                total_value_loss += v_loss
+            entropy = K.sum(KL.categorical_crossentropy(ns_policy, ns_policy)) + \
+                      K.sum(KL.categorical_crossentropy(spatial_policy, spatial_policy))
+            advantage = value - reward
 
-        print('Step %d: Average loss - policy: %.4f  value: %.4f' %
-              (self.episodes, total_policy_loss/len(self.recorder), total_value_loss/len(self.recorder)))
+            # Is policy loss correct here?  Why is there a negative?
+            policy_loss = -K.sum(K.log(ns_policy)) * K.sum(K.log(spatial_policy)) * advantage - entropy * ENTROPY_RATE
+            total_loss = policy_loss + value_loss
+
+            # advantage = discounted_reward - value
+            # p_loss = self.policy_loss(spatial_policy, ns_policy, value, reward)
+            # v_loss = self.value_loss(value, reward)
+            # total_loss = p_loss + v_loss
+        gradients = tape.gradient(total_loss, self.model.trainable_variables)
+        self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
+
+    def strip_reshape(self, arr):
+        return np.reshape(arr, tuple(s for s in arr.shape if s > 1))
 
     # Takes a state and returns an action, also updates step information
-    def step(self, obs):
+    def step(self, obs, training=True):
         self.steps += 1
         # On first step, center camera in map (maybe best in map editor?)
         # if self.steps == 1:
@@ -167,70 +155,88 @@ class SpicyAgent:
         #     return actions.FunctionCall(actions.FUNCTIONS.move_camera.id, [32, 32])
 
         # Calculate reward of previous step and update it's state
-        if self.steps != 0:
-            reward = self.calc_reward(obs, self.recorder[self.steps-1].obs)
-            self.recorder[self.steps-1].update(obs, self.calc_reward(obs, reward))
+        if self.steps != 1:
+            reward = self.calc_reward(obs, self.recorder[-1].obs)
+            self.recorder[-1].update(reward)
 
         screens_input, ns_input = self.build_inputs_from_obs(obs)
 
-        print('Input Shapes: %s -- %s' % (screens_input.shape, ns_input.shape))
-        spatial_action_policy, ns_action_policy, value = self.build_model(screens_input, ns_input, len(self.action_options) + len(self.arg_options))
-        print('Output Shapes: %s -- %s' % (spatial_action_policy.shape, ns_action_policy.shape))
+        # print('Input Shapes: %s -- %s' % (screens_input.shape, ns_input.shape))
+        spatial_action_policy, ns_action_policy, value = self.model.predict([screens_input, ns_input], batch_size=1)
+        # print('Output Shapes: %s -- %s -- %s' % (spatial_action_policy.shape, ns_action_policy.shape, value.shape))
+
+        # Remove dimensions with length 1
+        spatial_action_policy = self.strip_reshape(spatial_action_policy)
+        ns_action_policy = self.strip_reshape(ns_action_policy)
 
         # Clip the values to 1
         #   I don't think I should need to do this with sigmoid activation functions, yet I get errors
-        action_probs = np.clip(ns_action_policy, None, .9999999)[:len(self.action_options)]
-        action_args = np.clip(ns_action_policy, None, .9999999)[len(self.action_options):]
+        action_weights = np.clip(ns_action_policy, None, .9999999)[:, 0]
 
         screen_max = np.argmax(spatial_action_policy)
         screen_x = screen_max // spatial_action_policy.shape[1]
         screen_y = screen_max % spatial_action_policy.shape[1]
 
-        # Filter out unavailable actions before choosing the best one
-        for ndx in range(len(action_probs)):
-            if self.action_options[ndx] not in obs.observation['available_actions']:
-                action_probs[ndx] = 0.
+        # Create new array with only weights of available actions
+        action_probs = []
+        available_actions = []
+        for ndx, act_id in enumerate(self.action_options):
+            if act_id in obs.observation['available_actions']:
+                action_probs.append(action_weights[ndx])
+                available_actions.append(act_id)
 
-        # Compute softmax with unavailable actions removed
-        action_probs = tf.math.softmax(action_probs)
+        # Compute softmax with unavailable actions removed, normalize again to get around numpy random choice bug
+        action_probs = np.exp(action_probs) / np.sum(np.exp(action_probs))
+        # action_probs = np.array(tf.math.softmax(action_probs))
+        action_probs /= action_probs.sum()
 
-        # Use argmax for playing, use choice with probabilities for training
-        # action_id = self.action_options[int(np.argmax(action_probs))]
-        action_id = self.action_options[np.random.choice(range(action_probs), p=action_probs)]
+        if training:
+            # Select from probability distribution
+            choice = np.random.choice(range(len(action_probs)), p=action_probs)
+        else:
+            # Select highest probability
+            choice = int(np.argmax(action_probs))
 
+        action_args = ns_action_policy[choice, 1:]
+        action_id = available_actions[choice]
         build_args = []
+        args = iter(action_args)
         # Build action
         for arg in actions.FUNCTIONS[action_id].args:
-            if arg.name == 'screen1':
-                build_args.append([screen_x + 3, screen_y])
+            if arg.name == 'screen':
+                build_args.append([screen_x, screen_y])
             # screen2 is only part of rect_select so use preset size based on screen1 to avoid the variable
             elif arg.name == 'screen2':
                 build_args.append([(screen_x + self.SELECT_SIZE) % self.SCREEN_SIZE,
                                    (screen_y + self.SELECT_SIZE) % self.SCREEN_SIZE])
             elif arg.name == 'select_unit_id':
-                select_unit_id = action_args[self.arg_options.index('select_unit_id')]
-                local_index = math.floor(select_unit_id * len(self.unit_options))
+                select_unit_id = next(args)
+                local_index = int(select_unit_id * len(self.unit_options))
                 build_args.append([self.unit_options[local_index]])
             elif arg.name == 'select_add':
-                select_add = action_args[self.arg_options.index('select_add')]
-                build_args.append([math.floor(select_add * 2)])
-            elif arg.name in 'select_unit_act':
-                select_unit_act = action_args[self.arg_options.index('select_unit_act')]
-                build_args.append([math.floor(select_unit_act * 4)])
+                select_add = next(args)
+                build_args.append([int(select_add * 2)])
+            elif arg.name == 'select_unit_act':
+                select_unit_act = next(args)
+                build_args.append([int(select_unit_act * 4)])
             elif arg.name == 'select_point_act':
-                select_point_act = action_args[self.arg_options.index('select_point_act')]
-                build_args.append([math.floor(select_point_act * 4)])
+                select_point_act = next(args)
+                build_args.append([int(select_point_act * 4)])
             # Always set queued arg as false
             elif arg.name == 'queued':
                 build_args.append([0])
             else:
-                raise('Unrecognized function argument type: %s' % arg.name)
+                raise KeyError('Unrecognized function argument type: %s' % arg.name)
+
+        # Checking validitiy of arguments
+        if len(actions.FUNCTIONS[action_id].args) != len(build_args):
+            raise ValueError('%d != %d' % (len(actions.FUNCTIONS[action_id].args), len(build_args)))
 
         # TODO: Add LSTM
 
         self.recorder.append(State(obs, (screens_input, ns_input), (spatial_action_policy, ns_action_policy, value)))
-        print("Action: %d, Args: %s" % (action_id, action_args))
-        return actions.FunctionCall(action_id, action_args)
+        # print("Action: %s, Args: %s, %s" % (actions.FUNCTIONS[action_id].name, [a.name for a in actions.FUNCTIONS[action_id].args], build_args))
+        return actions.FunctionCall(action_id, build_args)
 
     def build_inputs_from_obs(self, obs):
         # Subset of screens to use as inputs
@@ -247,10 +253,21 @@ class SpicyAgent:
             elif name == 'unit_hit_points':
                 screens_input[ndx] = np.array(obs.observation['feature_screen'][name]) / self.UNIT_HP_SCALE
             else:
-                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]) / features.SCREEN_FEATURES[name].scale
+                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]) / getattr(features.SCREEN_FEATURES, name).scale
 
-        screens_input = screens_input.T
-        screens_input = np.reshape(screens_input, (1, self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE))
+        # screens_input = screens_input.T
+        screens_input = np.reshape(screens_input, (1, self.SCREEN_SIZE, self.SCREEN_SIZE, self.SCREEN_DEPTH))
+
+        # Create screen-sized array to copy the non-spacial parts into
+        ns_input = np.zeros((self.SCREEN_SIZE, 3))
+
+        # Available actions
+        act_count = len(self.action_options)
+        act_input = np.zeros((act_count, self.UNIT_TENSOR_LENGTH))
+        available_actions = obs.observation['available_actions']
+        for ndx, act_id in enumerate(self.action_options):
+            act_input[ndx, 0:self.UNIT_TENSOR_LENGTH] = (1. if act_id in available_actions else 0.)
+        ns_input[0:act_count, 0:self.UNIT_TENSOR_LENGTH] = act_input
 
         # Normalizes the unit select tensor and removes fields
         def convert_select_tensor(x):
@@ -260,17 +277,10 @@ class SpicyAgent:
                 x[2] / self.UNIT_HP_SCALE
             ], dtype=np.float32)
 
-        # Available actions
-        act_input = np.zeros(len(self.action_options))
-        available_actions = obs.observation['available_actions']
-        for ndx, act_id in enumerate(self.action_options):
-            act_input[ndx] = (1. if act_id in available_actions else 0.)
-
         # Selected units
-        multi_select = np.array(convert_select_tensor(obs.observation['multi_select']), dtype=np.float32)
-        ms = np.resize(multi_select, (self.UNIT_TENSOR_LENGTH, min(self.MAX_UNIT_SELECT, multi_select.shape[1])))
-
-        ns_input = np.concatenate((act_input, ms))
+        for ndx, unit in enumerate(obs.observation['multi_select']):
+            ns_input[act_count + ndx:act_count + ndx + 1, 0:self.UNIT_TENSOR_LENGTH] = convert_select_tensor(unit)
+        ns_input = np.reshape(ns_input, (1, self.SCREEN_SIZE, 3))
 
         return screens_input, ns_input
 
@@ -278,85 +288,78 @@ class SpicyAgent:
         if obs.last():
             return 0.
 
-        score = obs.observation['score_by_category']
-        score_prev = obs_prev.observation['score_by_category']
+        score = obs.observation['score_by_category'][2]
+        score_prev = obs_prev.observation['score_by_category'][2]
         # Difference in killed minerals and vespene - diff in lost minerals and vespene since last state
-        diff_value_lost = (score[1] - score_prev[1]) + self.VESPENE_SCALING*(score[2] - score_prev[2]) - \
-                          (score[3] - score_prev[3]) + self.VESPENE_SCALING*(score[4] - score_prev[4])
+        diff_value = (score[1] - score_prev[1]) + self.VESPENE_SCALING*(score[2] - score_prev[2]) - \
+                     (score[3] - score_prev[3]) + self.VESPENE_SCALING*(score[4] - score_prev[4])
 
-        score = obs.observation['score_by_vital']
-        score_prev = obs.observation['score_by_vital']
-        # Damage taken - damage dealt since last state
-        diff_damage_done = (score[0] - score_prev[0]) - (score[1] - score_prev[1])
+        score = obs.observation['score_by_vital'][2]
+        score_prev = obs.observation['score_by_vital'][2]
+        # Damage dealt - damage taken since last state
+        diff_damage = (score[0] - score_prev[0]) - (score[1] - score_prev[1])
 
-        reward = diff_value_lost + .5*diff_damage_done
-        print('Agent reward: %.3f' % reward)
+        reward = diff_value + .5*diff_damage
         return reward
 
     @tf.function
-    def build_model(self, screen, ns_input, action_size):
+    def value_loss(self, value, actual_value):
+        return KL.mean_squared_error(value, actual_value)
 
-        sconv1 = tf.layers.conv2d(screen,
-                                  num_outputs=16,
-                                  kernel_size=5,
-                                  stride=1,
-                                  scope='sconv1')
-        sconv2 = tf.layers.conv2d(sconv1,
-                                  num_outputs=32,
-                                  kernel_size=3,
-                                  stride=1,
-                                  scope='sconv2')
-        ns_input_fc = tf.layers.fully_connected(ns_input,
-                                                num_outputs=256,
-                                                activation_fn=tf.relu,
-                                                scope='info_fc')
+    @tf.function
+    def policy_loss(self, spatial, nonspatial, value, reward):
+        entropy = K.sum(KL.categorical_crossentropy(nonspatial, nonspatial)) + \
+                  K.sum(KL.categorical_crossentropy(spatial, spatial))
+        advantage = value - reward
 
-        # Compute spatial actions
-        state = tf.concat([sconv2, ns_input_fc], axis=3)
-        spatial_action_policy = tf.layers.conv2d(state,
-                                                 num_outputs=1,
-                                                 kernel_size=1,
-                                                 stride=1,
-                                                 activation_fn=None,
-                                                 scope='spatial_action')
-        spatial_action_policy = tf.nn.softmax(tf.layers.flatten(spatial_action_policy))
+        # Is policy loss correct here?  Why is there a negative?
+        p_loss = -K.sum(K.log(nonspatial)) * K.sum(K.log(spatial)) * advantage
+        total_loss = p_loss - entropy * ENTROPY_RATE
+        return total_loss
 
-        # Compute non spatial actions and value
-        state_fc = tf.layers.fully_connected(state,
-                                             num_outputs=256,
-                                             activation_fn=tf.nn.relu,
-                                             scope='feat_fc')
-        ns_action_policy = tf.layers.fully_connected(state_fc,
-                                                     num_outputs=action_size,
-                                                     activation_fn=None,
-                                                     scope='non_spatial_action')
-        value = tf.layers.fully_connected(state_fc,
-                                          num_outputs=1,
-                                          activation_fn=None,
-                                          scope='value')
 
-        return spatial_action_policy, ns_action_policy, value
+    def build_model(self, screen_width, screen_height, screen_depth, ns_input_length, action_size):
+        K.set_floatx('float32')
+
+        # Inputs
+        screen_input = Input(shape=(screen_width, screen_height, screen_depth), dtype='float32')
+        ns_input = Input(shape=(screen_width, ns_input_length), dtype='float32')
+
+        screen = Conv2D(screen_depth, 5, strides=1, padding='same', activation='relu')(screen_input)
+        screen = Conv2D(2*screen_depth, 3, strides=1, padding='same', activation='relu')(screen)
+        # screen = MaxPooling2D()(screen)
+
+        ns = Dense(screen_height, use_bias=True, activation='relu')(ns_input)
+        ns = Reshape((screen_width, screen_height, 1,))(ns)
+
+        state = Concatenate(axis=3)([screen, ns])
+
+        spacial_action_policy = Conv2D(1, 3, padding='same')(state)
+        spacial_action_policy = Reshape((screen_width, screen_height))(spacial_action_policy)
+
+        state_ns = Conv2D(1, 3, strides=2, padding='same', activation='relu')(state)
+        state_ns = Flatten()(state_ns)
+        state_ns = Dense(32, use_bias=True, activation='relu')(state_ns)
+
+        ns_action_policy = Dense(action_size*3, use_bias=True, activation='relu')(state_ns)
+        ns_action_policy = Reshape((action_size, 3))(ns_action_policy)
+
+        value = Dense(1, use_bias=True)(state_ns)
+
+        model = Model([screen_input, ns_input], [spacial_action_policy, ns_action_policy, value])
+
+        return model
 
 
 class State:
     def __init__(self, observation, inputs, outputs):
         self.obs = observation
-        self.inputs = {
-            'spatial': inputs[0],
-            'nonspatial': inputs[1]
-        }
-        self.outputs = {
-            'spatial': outputs[0],
-            'nonspatial': outputs[1],
-            'value': outputs[2]
-        }
+        self.inputs = inputs
+        self.outputs = outputs
         self.next_obs = None
-        self.reward = None
-        self.done = True
+        self.reward = 0.
+        self.done = True  # Assume done if state isn't updated
 
-    def update(self, next_observation, reward):
-        self.next_obs = next_observation
+    def update(self, reward):
         self.reward = reward
         self.done = False
-
-
