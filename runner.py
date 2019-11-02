@@ -1,6 +1,5 @@
 import time
 from itertools import count, combinations
-from tensorflow.python.framework.ops import disable_eager_execution
 
 from absl import app
 from absl import flags
@@ -11,6 +10,12 @@ from pysc2.lib.protocol import ProtocolError
 
 from spicy_agent import SpicyAgent
 from maps import MapCM, MapCMI
+import warnings
+
+import os
+# import sys
+# import numpy
+# numpy.set_printoptions(threshold=sys.maxsize)
 
 
 FLAGS = flags.FLAGS
@@ -62,16 +67,24 @@ def run(players, map_name, visualize):
                 action_space=FLAGS.action_space,
                 use_feature_units=FLAGS.use_feature_units,
                 use_raw_units=FLAGS.use_raw_units),
+            ensure_available_actions=True,
             step_mul=FLAGS.step_mul,
+            realtime=True,
             game_steps_per_episode=FLAGS.game_steps_per_episode,
             disable_fog=FLAGS.disable_fog,
             visualize=visualize) as env:
         env = available_actions_printer.AvailableActionsPrinter(env)
 
         # Initialize agents
-        agents = [SpicyAgent() for _ in range(AGENT_COUNT)]
+        agents = []
+        for i in range(AGENT_COUNT):
+            agent = SpicyAgent('agent%d' % i)
+            if os.path.exists('./save/%s.tf' % agent.name):
+                agent.model.load_weights('./save/%s.tf' % agent.name)
+            agents.append(agent)
 
-        for _ in count(1):
+        for gen in count(1):
+            print('>>> Begin generation %d' % gen)
 
             # Full round robin
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
@@ -80,22 +93,26 @@ def run(players, map_name, visualize):
 
                 # 16 steps = 1 second of game time, running 1 frame every 8 steps is 2 frames per second
                 # End right before scenario timer or it sometimes crashes
-                print('>>> Start game loop')
+                print('>>> Start game loop between %s and %s' % (player1.name, player2.name))
                 run_scenario_loop([player1, player2], env, max_frames=2*119)
 
                 print('>>> Train agents')
                 player1.train()
                 player2.train()
 
+            for agent in agents:
+                agent.model.save_weights('./save/%s.tf' % agent.name)
+
 
 def run_scenario_loop(agents, env, max_frames=0):
     total_frames = 0
+    episode = 1
     start_time = time.time()
 
-    observation_spec = env.observation_spec()
-    action_spec = env.action_spec()
-    for agent, obs_spec, act_spec in zip(agents, observation_spec, action_spec):
-        agent.setup(obs_spec, act_spec)
+    # observation_spec = env.observation_spec()
+    # action_spec = env.action_spec()
+    # for agent, obs_spec, act_spec in zip(agents, observation_spec, action_spec):
+    #     agent.setup(obs_spec, act_spec)
 
     states = env.reset()
     while True:
@@ -103,15 +120,19 @@ def run_scenario_loop(agents, env, max_frames=0):
         actions = [agent.step(state) for agent, state in zip(agents, states)]
         states = env.step(actions)
 
-        if states[0].last() or states[1].last() or (max_frames and total_frames >= max_frames):
-            break
+        if states[0].last() or states[1].last():# or (max_frames and total_frames >= max_frames):
+            print('Detected end of game')
+            if episode >= 1:
+                break
+            episode += 1
+            total_frames = 0
+            states = env.reset()
 
     elapsed_time = time.time() - start_time
     print("Took %.3f seconds at %.3f fps" % (elapsed_time, total_frames / elapsed_time))
 
 
 def main(unused_argv):
-    SpicyAgent()
 
     """Run an agent."""
     if FLAGS.trace:
@@ -131,12 +152,13 @@ def main(unused_argv):
 
 
 if __name__ == "__main__":
+    # Good programming practice: Silence all warnings :P
+    warnings.filterwarnings("ignore")
+
     # Register maps
     MapCM()
     MapCMI()
     globals()['CodeMagenta'] = type('CodeMagenta', (MapCM,), dict(filename='CodeMagenta'))
     globals()['CodeMagentaIsland'] = type('CodeMagentaIsland', (MapCMI,), dict(filename='CodeMagentaIsland'))
-
-    # disable_eager_execution()
 
     app.run(main)

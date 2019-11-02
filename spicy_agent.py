@@ -6,11 +6,12 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.keras.backend as K
 import tensorflow.keras.losses as KL
-from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape, Input
-from tensorflow.keras.optimizers import RMSprop
+from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape, Input, LSTM
+from tensorflow.keras.optimizers import RMSprop, SGD
 from tensorflow.keras import Model
 
 import math
+import time
 
 # from spicy_model import SpicyModel
 from spicy_config import *
@@ -57,10 +58,11 @@ class SpicyAgent:
     VESPENE_SCALING = 1.5
     UNIT_HP_SCALE = 200  # 1600 by default
 
-    def __init__(self):
+    def __init__(self, name='agent'):
         self.reward = 0
         self.episodes = 0
         self.steps = 0
+        self.name = name
         self.obs_spec = None
         self.action_spec = None
 
@@ -71,17 +73,17 @@ class SpicyAgent:
                                       self.SCREEN_DEPTH,
                                       self.UNIT_TENSOR_LENGTH,
                                       len(self.action_options))
-        # self.model.summary()
+        self.model.summary()
         self.opt = RMSprop(lr=LEARNING_RATE)
+        # self.opt = SGD(lr=LEARNING_RATE)
 
         # Output placeholders
-        self.value_pl = K.placeholder(shape=(None,))
-        self.actual_value_pl = K.placeholder(shape=(None,))
-        self.advantage_pl = K.placeholder(shape=(None,))
-        self.reward_pl = K.placeholder(shape=(None,))
-        self.ns_policy_pl = K.placeholder(shape=(len(self.action_options), 3))
-        self.spatial_policy_pl = K.placeholder(shape=(self.SCREEN_SIZE, self.SCREEN_SIZE))
-
+        # self.value_pl = K.placeholder(shape=(None,))
+        # self.actual_value_pl = K.placeholder(shape=(None,))
+        # self.advantage_pl = K.placeholder(shape=(None,))
+        # self.reward_pl = K.placeholder(shape=(None,))
+        # self.ns_policy_pl = K.placeholder(shape=(len(self.action_options), 3))
+        # self.spatial_policy_pl = K.placeholder(shape=(self.SCREEN_SIZE, self.SCREEN_SIZE))
 
         # How to convert blizzard unit and building IDs to our subset of units
         def convert_unit_ids(x):
@@ -113,34 +115,42 @@ class SpicyAgent:
 
     # Uses the experience from recorded data to train model
     def train(self):
-        # TODO: Only look at action probability part of ns_policy
+        t1 = time.time()
         discounted_reward = 0
         for state in reversed(self.recorder):
             if not state.done:
                 discounted_reward = np.float32(state.reward + DISCOUNT_RATE * discounted_reward)
-                self.train_one_step(state.inputs, discounted_reward)
+                self.train_one_step(state.inputs, discounted_reward, state.ns_action, state.s_action)
 
-        print('Training round complete')
+        print('Training round complete for %s, time taken: %.1f' % (self.name, time.time() - t1))
 
-    # @tf.function
-    def train_one_step(self, inputs, reward):
+    def train_one_step(self, inputs, reward, action, screen_action):
         with tf.GradientTape() as tape:
             spatial_policy, ns_policy, value = self.model(inputs)
+            ns_weights = ns_policy[:, :, 0]   # Only look at action probability part of ns_policy
+
+            action_one_hot = K.one_hot(action, len(self.action_options))
+            screen_action_one_hot = K.one_hot(screen_action, self.SCREEN_SIZE * self.SCREEN_SIZE)
+
+            advantage = reward - value
+
+            # entropy = K.sum(KL.categorical_crossentropy(ns_weights, ns_weights)) + \
+            #           K.sum(KL.categorical_crossentropy(spatial_policy, spatial_policy))
+            entropy = K.sum(ns_weights * K.log(ns_weights + 1e-10)) + \
+                      K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
             value_loss = KL.mean_squared_error(value, reward)
+            policy_loss = KL.categorical_crossentropy(action_one_hot, ns_weights, from_logits=True) * \
+                          KL.categorical_crossentropy(screen_action_one_hot, K.flatten(spatial_policy), from_logits=True) * \
+                          advantage
+            total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
 
-            entropy = K.sum(KL.categorical_crossentropy(ns_policy, ns_policy)) + \
-                      K.sum(KL.categorical_crossentropy(spatial_policy, spatial_policy))
-            advantage = value - reward
-
-            # Is policy loss correct here?  Why is there a negative?
-            policy_loss = -K.sum(K.log(ns_policy)) * K.sum(K.log(spatial_policy)) * advantage - entropy * ENTROPY_RATE
-            total_loss = policy_loss + value_loss
-
-            # advantage = discounted_reward - value
-            # p_loss = self.policy_loss(spatial_policy, ns_policy, value, reward)
-            # v_loss = self.value_loss(value, reward)
-            # total_loss = p_loss + v_loss
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
+
+        # capped_gradients = [K.clip(grad, -1., 1.) for grad in gradients]
+        # for grad in gradients:
+        #     if np.any(np.isnan(grad)):
+        #         raise ValueError('NaN found in gradient')
+
         self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
 
     def strip_reshape(self, arr):
@@ -160,22 +170,27 @@ class SpicyAgent:
             self.recorder[-1].update(reward)
 
         screens_input, ns_input = self.build_inputs_from_obs(obs)
+        spatial_action_policy, ns_action_policy, value = self.model([screens_input, ns_input])
 
-        # print('Input Shapes: %s -- %s' % (screens_input.shape, ns_input.shape))
-        spatial_action_policy, ns_action_policy, value = self.model.predict([screens_input, ns_input], batch_size=1)
-        # print('Output Shapes: %s -- %s -- %s' % (spatial_action_policy.shape, ns_action_policy.shape, value.shape))
+        if np.any(np.isnan(ns_action_policy)) or np.any(np.isnan(spatial_action_policy)):
+            raise ValueError('NaN found in output tensor')
 
         # Remove dimensions with length 1
         spatial_action_policy = self.strip_reshape(spatial_action_policy)
         ns_action_policy = self.strip_reshape(ns_action_policy)
 
+        if training:
+            screen_choice = np.random.choice(range(self.SCREEN_SIZE*self.SCREEN_SIZE),
+                                             p=spatial_action_policy.flatten()/np.sum(spatial_action_policy))
+        else:
+            screen_choice = np.argmax(spatial_action_policy)
+
+        screen_x = screen_choice // spatial_action_policy.shape[1]
+        screen_y = screen_choice % spatial_action_policy.shape[1]
+
         # Clip the values to 1
         #   I don't think I should need to do this with sigmoid activation functions, yet I get errors
         action_weights = np.clip(ns_action_policy, None, .9999999)[:, 0]
-
-        screen_max = np.argmax(spatial_action_policy)
-        screen_x = screen_max // spatial_action_policy.shape[1]
-        screen_y = screen_max % spatial_action_policy.shape[1]
 
         # Create new array with only weights of available actions
         action_probs = []
@@ -188,7 +203,7 @@ class SpicyAgent:
         # Compute softmax with unavailable actions removed, normalize again to get around numpy random choice bug
         action_probs = np.exp(action_probs) / np.sum(np.exp(action_probs))
         # action_probs = np.array(tf.math.softmax(action_probs))
-        action_probs /= action_probs.sum()
+        # action_probs /= action_probs.sum()
 
         if training:
             # Select from probability distribution
@@ -198,6 +213,7 @@ class SpicyAgent:
             choice = int(np.argmax(action_probs))
 
         action_args = ns_action_policy[choice, 1:]
+        action_args = np.clip(action_args, 0., .999999)
         action_id = available_actions[choice]
         build_args = []
         args = iter(action_args)
@@ -232,9 +248,14 @@ class SpicyAgent:
         if len(actions.FUNCTIONS[action_id].args) != len(build_args):
             raise ValueError('%d != %d' % (len(actions.FUNCTIONS[action_id].args), len(build_args)))
 
-        # TODO: Add LSTM
-
-        self.recorder.append(State(obs, (screens_input, ns_input), (spatial_action_policy, ns_action_policy, value)))
+        self.recorder.append(
+            State(obs,
+                  (screens_input, ns_input),
+                  (spatial_action_policy, ns_action_policy, value),
+                  choice,
+                  screen_choice)
+        )
+        # print('Coords: %d, %d' % (screen_x, screen_y))
         # print("Action: %s, Args: %s, %s" % (actions.FUNCTIONS[action_id].name, [a.name for a in actions.FUNCTIONS[action_id].args], build_args))
         return actions.FunctionCall(action_id, build_args)
 
@@ -282,6 +303,9 @@ class SpicyAgent:
             ns_input[act_count + ndx:act_count + ndx + 1, 0:self.UNIT_TENSOR_LENGTH] = convert_select_tensor(unit)
         ns_input = np.reshape(ns_input, (1, self.SCREEN_SIZE, 3))
 
+        if np.isin(np.NaN, ns_input) or np.isin(np.NaN, screens_input):
+            raise ValueError('NaN found in input tensor')
+
         return screens_input, ns_input
 
     def calc_reward(self, obs, obs_prev):
@@ -299,24 +323,9 @@ class SpicyAgent:
         # Damage dealt - damage taken since last state
         diff_damage = (score[0] - score_prev[0]) - (score[1] - score_prev[1])
 
-        reward = diff_value + .5*diff_damage
+        reward = .01 * (diff_value + .5*diff_damage)
+        # print('Change in reward: %.2f' % reward)
         return reward
-
-    @tf.function
-    def value_loss(self, value, actual_value):
-        return KL.mean_squared_error(value, actual_value)
-
-    @tf.function
-    def policy_loss(self, spatial, nonspatial, value, reward):
-        entropy = K.sum(KL.categorical_crossentropy(nonspatial, nonspatial)) + \
-                  K.sum(KL.categorical_crossentropy(spatial, spatial))
-        advantage = value - reward
-
-        # Is policy loss correct here?  Why is there a negative?
-        p_loss = -K.sum(K.log(nonspatial)) * K.sum(K.log(spatial)) * advantage
-        total_loss = p_loss - entropy * ENTROPY_RATE
-        return total_loss
-
 
     def build_model(self, screen_width, screen_height, screen_depth, ns_input_length, action_size):
         K.set_floatx('float32')
@@ -334,14 +343,16 @@ class SpicyAgent:
 
         state = Concatenate(axis=3)([screen, ns])
 
-        spacial_action_policy = Conv2D(1, 3, padding='same')(state)
+        spacial_action_policy = Conv2D(1, 3, padding='same', activation='softmax')(state)
         spacial_action_policy = Reshape((screen_width, screen_height))(spacial_action_policy)
 
-        state_ns = Conv2D(1, 3, strides=2, padding='same', activation='relu')(state)
+        state_ns = Conv2D(1, 5, strides=3, padding='valid', activation='relu')(state)
         state_ns = Flatten()(state_ns)
         state_ns = Dense(32, use_bias=True, activation='relu')(state_ns)
 
-        ns_action_policy = Dense(action_size*3, use_bias=True, activation='relu')(state_ns)
+        ns_action_policy = Dense(action_size*3, use_bias=True)(state_ns)
+        ns_action_policy = Reshape((action_size, 3))(ns_action_policy)
+        ns_action_policy = LSTM(action_size*3, activation='sigmoid')(ns_action_policy)
         ns_action_policy = Reshape((action_size, 3))(ns_action_policy)
 
         value = Dense(1, use_bias=True)(state_ns)
@@ -352,12 +363,14 @@ class SpicyAgent:
 
 
 class State:
-    def __init__(self, observation, inputs, outputs):
+    def __init__(self, observation, inputs, outputs, ns_action, s_action):
         self.obs = observation
         self.inputs = inputs
         self.outputs = outputs
         self.next_obs = None
         self.reward = 0.
+        self.ns_action = ns_action
+        self.s_action = s_action
         self.done = True  # Assume done if state isn't updated
 
     def update(self, reward):
