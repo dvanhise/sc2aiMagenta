@@ -10,27 +10,79 @@ from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concat
 from tensorflow.keras.optimizers import RMSprop, SGD
 from tensorflow.keras import Model
 
-import math
 import time
 
-# from spicy_model import SpicyModel
 from spicy_config import *
 
 
 class SpicyAgent:
 
+    MAX_CONTROL_GROUPS = 3
+    MAX_UNIT_SELECT = 5
+
+    SCREEN_SIZE = 64
+    SCREEN_DEPTH = 9  # Number of screen views to use
+
+    ARG_COUNT = 8  # Size of arg tensor
+
+    UNIT_TENSOR_LENGTH = 3
+
+    SELECT_SIZE = 3
+
+    VESPENE_SCALING = 1.5
+    UNIT_HP_SCALE = 200  # 1600 by default
+
     action_options = [
-        actions.FUNCTIONS.no_op.id,
-        actions.FUNCTIONS.select_point.id,
-        actions.FUNCTIONS.select_rect.id,
-        actions.FUNCTIONS.select_unit.id,
-        actions.FUNCTIONS.select_army.id,
-        actions.FUNCTIONS.Attack_screen.id,
-        actions.FUNCTIONS.Cancel_quick.id,
-        actions.FUNCTIONS.HoldPosition_quick.id,
-        actions.FUNCTIONS.Move_screen.id,
-        actions.FUNCTIONS.Patrol_screen.id
+        {
+            'id': actions.FUNCTIONS.no_op.id,
+            'args': []
+        },
+        *({
+            'id': actions.FUNCTIONS.select_point.id,
+            'args': [act, 'screen']
+        } for act in range(4)),
+        {
+            'id': actions.FUNCTIONS.select_rect.id,
+            'args': [0, 'screen_rect']
+        },
+        {
+            'id': actions.FUNCTIONS.select_rect.id,
+            'args': [1, 'screen_rect']
+        },
+        # Every combination of set/recall/add option and control group id
+        # *({'id': actions.FUNCTIONS.select_control_group.id, 'args': [act, id]} for id in range(MAX_CONTROL_GROUPS) for act in range(3)),
+        # Every combination of unit select options and unit to select
+        *({'id': actions.FUNCTIONS.select_unit.id, 'args': [act, id]} for id in range(MAX_UNIT_SELECT) for act in range(4)),
+        {
+            'id': actions.FUNCTIONS.select_army.id,
+            'args': [0]
+        },
+        {
+            'id': actions.FUNCTIONS.select_army.id,
+            'args': [1]
+        },
+        {
+            'id': actions.FUNCTIONS.Attack_screen.id,
+            'args': [0, 'screen']
+        },
+        {
+            'id': actions.FUNCTIONS.Cancel_quick.id,
+            'args': [0]
+        },
+        {
+            'id': actions.FUNCTIONS.Move_screen.id,
+            'args': [0, 'screen']
+        },
+        {
+            'id': actions.FUNCTIONS.HoldPosition_quick.id,
+            'args': [0]
+        },
+        {
+            'id': actions.FUNCTIONS.Patrol_screen.id,
+            'args': [0, 'screen']
+        }
     ]
+    print('%d actions detected' % len(action_options))
 
     unit_options = [
         units.Terran.Marine,
@@ -44,19 +96,6 @@ class SpicyAgent:
         'select_unit_act',
         'select_point_act',
     ]
-
-    SCREEN_SIZE = 64
-    SCREEN_DEPTH = 9  # Number of screen views to use
-
-    ARG_COUNT = 8  # Size of arg tensor
-
-    UNIT_TENSOR_LENGTH = 3
-
-    SELECT_SIZE = 3
-    MAX_UNIT_SELECT = SCREEN_SIZE - len(action_options)
-
-    VESPENE_SCALING = 1.5
-    UNIT_HP_SCALE = 200  # 1600 by default
 
     def __init__(self, name='agent'):
         self.reward = 0
@@ -75,15 +114,6 @@ class SpicyAgent:
                                       len(self.action_options))
         self.model.summary()
         self.opt = RMSprop(lr=LEARNING_RATE)
-        # self.opt = SGD(lr=LEARNING_RATE)
-
-        # Output placeholders
-        # self.value_pl = K.placeholder(shape=(None,))
-        # self.actual_value_pl = K.placeholder(shape=(None,))
-        # self.advantage_pl = K.placeholder(shape=(None,))
-        # self.reward_pl = K.placeholder(shape=(None,))
-        # self.ns_policy_pl = K.placeholder(shape=(len(self.action_options), 3))
-        # self.spatial_policy_pl = K.placeholder(shape=(self.SCREEN_SIZE, self.SCREEN_SIZE))
 
         # How to convert blizzard unit and building IDs to our subset of units
         def convert_unit_ids(x):
@@ -113,11 +143,15 @@ class SpicyAgent:
         self.steps = 0
         self.episodes += 1
 
-    # Uses the experience from recorded data to train model
+    # Train model with game data in self.recorder
     def train(self):
         t1 = time.time()
+        # Update all rewards to discounted rewards
         discounted_reward = 0
         for state in reversed(self.recorder):
+            state.reward = state.reward + DISCOUNT_RATE * discounted_reward
+
+        for state in self.recorder:
             if not state.done:
                 discounted_reward = np.float32(state.reward + DISCOUNT_RATE * discounted_reward)
                 self.train_one_step(state.inputs, discounted_reward, state.ns_action, state.s_action)
@@ -127,31 +161,29 @@ class SpicyAgent:
     def train_one_step(self, inputs, reward, action, screen_action):
         with tf.GradientTape() as tape:
             spatial_policy, ns_policy, value = self.model(inputs)
-            ns_weights = ns_policy[:, :, 0]   # Only look at action probability part of ns_policy
+            ns_policy = K.softmax(ns_policy)
 
             action_one_hot = K.one_hot(action, len(self.action_options))
             screen_action_one_hot = K.one_hot(screen_action, self.SCREEN_SIZE * self.SCREEN_SIZE)
 
             advantage = reward - value
 
-            # entropy = K.sum(KL.categorical_crossentropy(ns_weights, ns_weights)) + \
-            #           K.sum(KL.categorical_crossentropy(spatial_policy, spatial_policy))
-            entropy = K.sum(ns_weights * K.log(ns_weights + 1e-10)) + \
+            entropy = K.sum(ns_policy * K.log(ns_policy + 1e-10)) + \
                       K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
             value_loss = KL.mean_squared_error(value, reward)
-            policy_loss = KL.categorical_crossentropy(action_one_hot, ns_weights, from_logits=True) * \
+            policy_loss = KL.categorical_crossentropy(action_one_hot, ns_policy, from_logits=True) * \
                           KL.categorical_crossentropy(screen_action_one_hot, K.flatten(spatial_policy), from_logits=True) * \
                           advantage
             total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
 
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
 
-        # capped_gradients = [K.clip(grad, -1., 1.) for grad in gradients]
-        # for grad in gradients:
-        #     if np.any(np.isnan(grad)):
-        #         raise ValueError('NaN found in gradient')
+        capped_gradients = [K.clip(grad, -1., 1.) for grad in gradients]
+        for grad in gradients:
+            if np.any(np.isnan(grad)):
+                raise ValueError('NaN found in gradient')
 
-        self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
+        self.opt.apply_gradients(zip(capped_gradients, self.model.trainable_variables))
 
     def strip_reshape(self, arr):
         return np.reshape(arr, tuple(s for s in arr.shape if s > 1))
@@ -159,18 +191,16 @@ class SpicyAgent:
     # Takes a state and returns an action, also updates step information
     def step(self, obs, training=True):
         self.steps += 1
-        # On first step, center camera in map (maybe best in map editor?)
-        # if self.steps == 1:
-        #     return actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
-        #     return actions.FunctionCall(actions.FUNCTIONS.move_camera.id, [32, 32])
 
         # Calculate reward of previous step and update it's state
         if self.steps != 1:
             reward = self.calc_reward(obs, self.recorder[-1].obs)
             self.recorder[-1].update(reward)
+            print('Reward: %.2f' % reward)
 
         screens_input, ns_input = self.build_inputs_from_obs(obs)
         spatial_action_policy, ns_action_policy, value = self.model([screens_input, ns_input])
+        # print('shape: %s  %s' % (spatial_action_policy.shape, ns_action_policy.shape))
 
         if np.any(np.isnan(ns_action_policy)) or np.any(np.isnan(spatial_action_policy)):
             raise ValueError('NaN found in output tensor')
@@ -180,25 +210,21 @@ class SpicyAgent:
         ns_action_policy = self.strip_reshape(ns_action_policy)
 
         if training:
-            screen_choice = np.random.choice(range(self.SCREEN_SIZE*self.SCREEN_SIZE),
-                                             p=spatial_action_policy.flatten()/np.sum(spatial_action_policy))
+            screen_choice = np.random.choice(self.SCREEN_SIZE * self.SCREEN_SIZE,
+                                             p=spatial_action_policy.flatten() / np.sum(spatial_action_policy))
         else:
             screen_choice = np.argmax(spatial_action_policy)
 
-        screen_x = screen_choice // spatial_action_policy.shape[1]
-        screen_y = screen_choice % spatial_action_policy.shape[1]
-
-        # Clip the values to 1
-        #   I don't think I should need to do this with sigmoid activation functions, yet I get errors
-        action_weights = np.clip(ns_action_policy, None, .9999999)[:, 0]
+        screen_x = screen_choice // self.SCREEN_SIZE
+        screen_y = screen_choice % self.SCREEN_SIZE
 
         # Create new array with only weights of available actions
         action_probs = []
         available_actions = []
-        for ndx, act_id in enumerate(self.action_options):
-            if act_id in obs.observation['available_actions']:
-                action_probs.append(action_weights[ndx])
-                available_actions.append(act_id)
+        for ndx, act_info in enumerate(self.action_options):
+            if act_info['id'] in obs.observation['available_actions']:
+                action_probs.append(ns_action_policy[ndx])
+                available_actions.append((act_info, ndx))
 
         # Compute softmax with unavailable actions removed, normalize again to get around numpy random choice bug
         action_probs = np.exp(action_probs) / np.sum(np.exp(action_probs))
@@ -207,57 +233,36 @@ class SpicyAgent:
 
         if training:
             # Select from probability distribution
-            choice = np.random.choice(range(len(action_probs)), p=action_probs)
+            choice = np.random.choice(len(action_probs), p=action_probs)
         else:
             # Select highest probability
             choice = int(np.argmax(action_probs))
 
-        action_args = ns_action_policy[choice, 1:]
-        action_args = np.clip(action_args, 0., .999999)
-        action_id = available_actions[choice]
+        action, real_index = available_actions[choice]
         build_args = []
-        args = iter(action_args)
         # Build action
-        for arg in actions.FUNCTIONS[action_id].args:
-            if arg.name == 'screen':
+        for arg in action['args']:
+            if arg == 'screen':
                 build_args.append([screen_x, screen_y])
-            # screen2 is only part of rect_select so use preset size based on screen1 to avoid the variable
-            elif arg.name == 'screen2':
-                build_args.append([(screen_x + self.SELECT_SIZE) % self.SCREEN_SIZE,
-                                   (screen_y + self.SELECT_SIZE) % self.SCREEN_SIZE])
-            elif arg.name == 'select_unit_id':
-                select_unit_id = next(args)
-                local_index = int(select_unit_id * len(self.unit_options))
-                build_args.append([self.unit_options[local_index]])
-            elif arg.name == 'select_add':
-                select_add = next(args)
-                build_args.append([int(select_add * 2)])
-            elif arg.name == 'select_unit_act':
-                select_unit_act = next(args)
-                build_args.append([int(select_unit_act * 4)])
-            elif arg.name == 'select_point_act':
-                select_point_act = next(args)
-                build_args.append([int(select_point_act * 4)])
-            # Always set queued arg as false
-            elif arg.name == 'queued':
-                build_args.append([0])
+            elif arg == 'screen_rect':
+                build_args.append([np.max([(screen_x - self.SELECT_SIZE), 0]),
+                                   np.max([(screen_y - self.SELECT_SIZE), 0])])
+                build_args.append([np.min([(screen_x + self.SELECT_SIZE), self.SCREEN_SIZE-1]),
+                                   np.min([(screen_y + self.SELECT_SIZE), self.SCREEN_SIZE-1])])
+            elif type(arg) is int:
+                build_args.append([arg])
             else:
-                raise KeyError('Unrecognized function argument type: %s' % arg.name)
-
-        # Checking validitiy of arguments
-        if len(actions.FUNCTIONS[action_id].args) != len(build_args):
-            raise ValueError('%d != %d' % (len(actions.FUNCTIONS[action_id].args), len(build_args)))
+                raise KeyError('Unrecognized function argument: %s' % arg)
 
         self.recorder.append(
             State(obs,
                   (screens_input, ns_input),
                   (spatial_action_policy, ns_action_policy, value),
-                  choice,
+                  real_index,
                   screen_choice)
         )
-        # print('Coords: %d, %d' % (screen_x, screen_y))
-        # print("Action: %s, Args: %s, %s" % (actions.FUNCTIONS[action_id].name, [a.name for a in actions.FUNCTIONS[action_id].args], build_args))
-        return actions.FunctionCall(action_id, build_args)
+        # print("Action: %s, Args: %s" % (actions.FUNCTIONS[action_id].name, build_args))
+        return actions.FunctionCall(action['id'], build_args)
 
     def build_inputs_from_obs(self, obs):
         # Subset of screens to use as inputs
@@ -286,8 +291,8 @@ class SpicyAgent:
         act_count = len(self.action_options)
         act_input = np.zeros((act_count, self.UNIT_TENSOR_LENGTH))
         available_actions = obs.observation['available_actions']
-        for ndx, act_id in enumerate(self.action_options):
-            act_input[ndx, 0:self.UNIT_TENSOR_LENGTH] = (1. if act_id in available_actions else 0.)
+        for ndx, act_info in enumerate(self.action_options):
+            act_input[ndx, 0:self.UNIT_TENSOR_LENGTH] = (1. if act_info['id'] in available_actions else 0.)
         ns_input[0:act_count, 0:self.UNIT_TENSOR_LENGTH] = act_input
 
         # Normalizes the unit select tensor and removes fields
@@ -343,21 +348,22 @@ class SpicyAgent:
 
         state = Concatenate(axis=3)([screen, ns])
 
-        spacial_action_policy = Conv2D(1, 3, padding='same', activation='softmax')(state)
-        spacial_action_policy = Reshape((screen_width, screen_height))(spacial_action_policy)
+        spatial_action_policy = Conv2D(1, 3, padding='same', activation='softmax')(state)
+        spatial_action_policy = Reshape((screen_width, screen_height))(spatial_action_policy)
+        # spatial_action_policy = LSTM(256)(spatial_action_policy)
 
         state_ns = Conv2D(1, 5, strides=3, padding='valid', activation='relu')(state)
         state_ns = Flatten()(state_ns)
-        state_ns = Dense(32, use_bias=True, activation='relu')(state_ns)
+        state_ns = Dense(32, use_bias=False, activation='relu')(state_ns)
 
-        ns_action_policy = Dense(action_size*3, use_bias=True)(state_ns)
-        ns_action_policy = Reshape((action_size, 3))(ns_action_policy)
-        ns_action_policy = LSTM(action_size*3, activation='sigmoid')(ns_action_policy)
-        ns_action_policy = Reshape((action_size, 3))(ns_action_policy)
+        ns_action_policy = Dense(action_size * 2, use_bias=True)(state_ns)
+        ns_action_policy = Reshape((action_size * 2, 1))(ns_action_policy)
+        ns_action_policy = LSTM(action_size)(ns_action_policy)
+        ns_action_policy = Reshape((action_size,))(ns_action_policy)
 
         value = Dense(1, use_bias=True)(state_ns)
 
-        model = Model([screen_input, ns_input], [spacial_action_policy, ns_action_policy, value])
+        model = Model([screen_input, ns_input], [spatial_action_policy, ns_action_policy, value])
 
         return model
 

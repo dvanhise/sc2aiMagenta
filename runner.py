@@ -94,7 +94,7 @@ def run(players, map_name, visualize):
                 # 16 steps = 1 second of game time, running 1 frame every 8 steps is 2 frames per second
                 # End right before scenario timer or it sometimes crashes
                 print('>>> Start game loop between %s and %s' % (player1.name, player2.name))
-                run_scenario_loop([player1, player2], env, max_frames=2*119)
+                run_scenario_loop([player1, player2], env)
 
                 print('>>> Train agents')
                 player1.train()
@@ -120,7 +120,7 @@ def run_scenario_loop(agents, env, max_frames=0):
         actions = [agent.step(state) for agent, state in zip(agents, states)]
         states = env.step(actions)
 
-        if states[0].last() or states[1].last():# or (max_frames and total_frames >= max_frames):
+        if states[0].last() or states[1].last() or (max_frames and total_frames >= max_frames):
             print('Detected end of game')
             if episode >= 1:
                 break
