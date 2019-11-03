@@ -11,6 +11,7 @@ from tensorflow.keras.optimizers import RMSprop, SGD
 from tensorflow.keras import Model
 
 import time
+import copy
 
 from spicy_config import *
 
@@ -151,17 +152,20 @@ class SpicyAgent:
         for state in reversed(self.recorder):
             state.reward = state.reward + DISCOUNT_RATE * discounted_reward
 
-        for state in self.recorder:
-            if not state.done:
-                discounted_reward = np.float32(state.reward + DISCOUNT_RATE * discounted_reward)
-                self.train_one_step(state.inputs, discounted_reward, state.ns_action, state.s_action)
-
+        self.train_batch(
+            self.strip_reshape(np.array([state.inputs[0] for state in self.recorder])),
+            self.strip_reshape(np.array([state.inputs[1] for state in self.recorder])),
+            np.array([state.reward for state in self.recorder], dtype=np.float32),
+            np.array([state.ns_action for state in self.recorder]),
+            np.array([state.s_action for state in self.recorder])
+        )
         print('Training round complete for %s, time taken: %.1f' % (self.name, time.time() - t1))
 
-    def train_one_step(self, inputs, reward, action, screen_action):
+    def train_batch(self, input1, input2, reward, action, screen_action):
         with tf.GradientTape() as tape:
-            spatial_policy, ns_policy, value = self.model(inputs)
+            spatial_policy, ns_policy, value = self.model([input1, input2])
             ns_policy = K.softmax(ns_policy)
+            # spatial_policy = K.flatten(spatial_policy)
 
             action_one_hot = K.one_hot(action, len(self.action_options))
             screen_action_one_hot = K.one_hot(screen_action, self.SCREEN_SIZE * self.SCREEN_SIZE)
@@ -172,18 +176,18 @@ class SpicyAgent:
                       K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
             value_loss = KL.mean_squared_error(value, reward)
             policy_loss = KL.categorical_crossentropy(action_one_hot, ns_policy, from_logits=True) * \
-                          KL.categorical_crossentropy(screen_action_one_hot, K.flatten(spatial_policy), from_logits=True) * \
+                          KL.categorical_crossentropy(screen_action_one_hot, spatial_policy, from_logits=True) * \
                           advantage
             total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
 
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
 
-        capped_gradients = [K.clip(grad, -1., 1.) for grad in gradients]
-        for grad in gradients:
-            if np.any(np.isnan(grad)):
-                raise ValueError('NaN found in gradient')
+        # capped_gradients = [K.clip(grad, -1., 1.) for grad in gradients]
+        # for grad in gradients:
+        #     if np.any(np.isnan(grad)):
+        #         raise ValueError('NaN found in gradient')
 
-        self.opt.apply_gradients(zip(capped_gradients, self.model.trainable_variables))
+        self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
 
     def strip_reshape(self, arr):
         return np.reshape(arr, tuple(s for s in arr.shape if s > 1))
@@ -196,7 +200,6 @@ class SpicyAgent:
         if self.steps != 1:
             reward = self.calc_reward(obs, self.recorder[-1].obs)
             self.recorder[-1].update(reward)
-            print('Reward: %.2f' % reward)
 
         screens_input, ns_input = self.build_inputs_from_obs(obs)
         spatial_action_policy, ns_action_policy, value = self.model([screens_input, ns_input])
@@ -211,7 +214,7 @@ class SpicyAgent:
 
         if training:
             screen_choice = np.random.choice(self.SCREEN_SIZE * self.SCREEN_SIZE,
-                                             p=spatial_action_policy.flatten() / np.sum(spatial_action_policy))
+                                             p=spatial_action_policy / np.sum(spatial_action_policy))
         else:
             screen_choice = np.argmax(spatial_action_policy)
 
@@ -317,18 +320,18 @@ class SpicyAgent:
         if obs.last():
             return 0.
 
-        score = obs.observation['score_by_category'][2]
-        score_prev = obs_prev.observation['score_by_category'][2]
+        score = obs.observation['score_by_category'][1]
+        score_prev = obs_prev.observation['score_by_category'][1]
         # Difference in killed minerals and vespene - diff in lost minerals and vespene since last state
         diff_value = (score[1] - score_prev[1]) + self.VESPENE_SCALING*(score[2] - score_prev[2]) - \
                      (score[3] - score_prev[3]) + self.VESPENE_SCALING*(score[4] - score_prev[4])
 
-        score = obs.observation['score_by_vital'][2]
-        score_prev = obs.observation['score_by_vital'][2]
+        score = obs.observation['score_by_vital'][1]
+        score_prev = obs_prev.observation['score_by_vital'][1]
         # Damage dealt - damage taken since last state
         diff_damage = (score[0] - score_prev[0]) - (score[1] - score_prev[1])
 
-        reward = .01 * (diff_value + .5*diff_damage)
+        reward = .05 * (diff_value + .5*diff_damage)
         # print('Change in reward: %.2f' % reward)
         return reward
 
@@ -349,8 +352,9 @@ class SpicyAgent:
         state = Concatenate(axis=3)([screen, ns])
 
         spatial_action_policy = Conv2D(1, 3, padding='same', activation='softmax')(state)
-        spatial_action_policy = Reshape((screen_width, screen_height))(spatial_action_policy)
+        # spatial_action_policy = Reshape((screen_width, screen_height))(spatial_action_policy)
         # spatial_action_policy = LSTM(256)(spatial_action_policy)
+        spatial_action_policy = Flatten()(spatial_action_policy)
 
         state_ns = Conv2D(1, 5, strides=3, padding='valid', activation='relu')(state)
         state_ns = Flatten()(state_ns)
@@ -370,7 +374,7 @@ class SpicyAgent:
 
 class State:
     def __init__(self, observation, inputs, outputs, ns_action, s_action):
-        self.obs = observation
+        self.obs = copy.deepcopy(observation)
         self.inputs = inputs
         self.outputs = outputs
         self.next_obs = None

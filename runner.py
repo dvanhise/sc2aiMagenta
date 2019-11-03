@@ -79,8 +79,10 @@ def run(players, map_name, visualize):
         agents = []
         for i in range(AGENT_COUNT):
             agent = SpicyAgent('agent%d' % i)
-            if os.path.exists('./save/%s.tf' % agent.name):
-                agent.model.load_weights('./save/%s.tf' % agent.name)
+            path = './save/%s.tf' % agent.name
+            if os.path.exists(path):
+                print('Loading from file %s' % path)
+                agent.model.load_weights(path)
             agents.append(agent)
 
         for gen in count(1):
