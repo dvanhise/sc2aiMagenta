@@ -83,7 +83,6 @@ class SpicyAgent:
             'args': [0, 'screen']
         }
     ]
-    print('%d actions detected' % len(action_options))
 
     unit_options = [
         units.Terran.Marine,
@@ -134,10 +133,6 @@ class SpicyAgent:
                 return 0.
         self.convert_player_ids = convert_player_ids
         self.convert_player_ids_vect = np.vectorize(convert_player_ids)
-
-    def setup(self, obs_spec, action_spec):
-        self.obs_spec = obs_spec
-        self.action_spec = action_spec
 
     def reset(self):
         self.recorder = []

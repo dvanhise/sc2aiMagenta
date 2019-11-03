@@ -6,16 +6,12 @@ from absl import flags
 
 from pysc2.env import available_actions_printer, sc2_env
 from pysc2.lib import point_flag, stopwatch
-from pysc2.lib.protocol import ProtocolError
 
 from spicy_agent import SpicyAgent
 from maps import MapCM, MapCMI
 import warnings
 
 import os
-# import sys
-# import numpy
-# numpy.set_printoptions(threshold=sys.maxsize)
 
 
 FLAGS = flags.FLAGS
@@ -80,9 +76,11 @@ def run(players, map_name, visualize):
         for i in range(AGENT_COUNT):
             agent = SpicyAgent('agent%d' % i)
             path = './save/%s.tf' % agent.name
-            if os.path.exists(path):
+            if os.path.exists(path + '.index'):
                 print('Loading from file %s' % path)
                 agent.model.load_weights(path)
+            else:
+                print('Could not find file, randomly initilizaing model')
             agents.append(agent)
 
         for gen in count(1):
@@ -110,11 +108,6 @@ def run_scenario_loop(agents, env, max_frames=0):
     total_frames = 0
     episode = 1
     start_time = time.time()
-
-    # observation_spec = env.observation_spec()
-    # action_spec = env.action_spec()
-    # for agent, obs_spec, act_spec in zip(agents, observation_spec, action_spec):
-    #     agent.setup(obs_spec, act_spec)
 
     states = env.reset()
     while True:
