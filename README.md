@@ -7,4 +7,8 @@ Trains AI agents to play a micro focused SC2 minigame.
 * Install packages in requirements.txt
 
 ### Usage
-Run with `python runner.py`
+Train agents: `python runner.py --mode=train --realtime=False`
+
+Demonstrate agents: `python runner.py --mode=test --vis=True`
+
+Play against trained agent: `python runner.py --mode=play`

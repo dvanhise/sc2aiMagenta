@@ -1,5 +1,9 @@
 import time
 from itertools import count, combinations
+import os
+import logging
+from datetime import datetime
+import random
 
 from absl import app
 from absl import flags
@@ -9,12 +13,18 @@ from pysc2.lib import point_flag, stopwatch
 
 from spicy_agent import SpicyAgent
 from maps import MapCM, MapCMI
-import warnings
-
-import os
 
 
 FLAGS = flags.FLAGS
+
+# train = AIs play each other, they explore new actions and train models
+# test = AIs play each other, they choose best possible actions
+# play = AI agent plays against human
+flags.DEFINE_enum('mode', 'train', ['train', 'test', 'play'], 'Whether to run in training mode.')
+flags.DEFINE_bool("vis", False, "Whether to show pygame feature maps window.")
+flags.DEFINE_bool("realtime", True, "Whether to run in realtime as opposed to max speed.")
+flags.DEFINE_string("map", "CodeMagentaIsland", "Name of a map to use.")
+flags.DEFINE_bool("save_replay", False, "Whether to save a replay of each game played.")
 
 point_flag.DEFINE_point("feature_screen_size", "64",
                         "Resolution for screen feature layers.")
@@ -35,21 +45,13 @@ flags.DEFINE_bool("disable_fog", True, "Whether to disable Fog of War.")
 flags.DEFINE_integer("step_mul", 8, "Game steps per agent step.")
 flags.DEFINE_integer("game_steps_per_episode", None, "Game steps per episode.")
 
-flags.DEFINE_bool("profile", False, "Whether to turn on code profiling.")
-flags.DEFINE_bool("trace", False, "Whether to trace the code execution.")
-flags.DEFINE_integer("parallel", 1, "How many instances to run in parallel.")
-
-flags.DEFINE_bool("save_replay", True, "Whether to save a replay at the end.")
-
-flags.DEFINE_string("map", "CodeMagentaIsland", "Name of a map to use.")
 flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
 flags.mark_flag_as_required("map")
 
+AGENT_COUNT = 5
 
-AGENT_COUNT = 4
 
-
-def run(players, map_name, visualize):
+def run(players, agents, map_name):
     """Run one thread worth of the environment with agents."""
     with sc2_env.SC2Env(
             map_name=map_name,
@@ -65,46 +67,50 @@ def run(players, map_name, visualize):
                 use_raw_units=FLAGS.use_raw_units),
             ensure_available_actions=True,
             step_mul=FLAGS.step_mul,
-            realtime=True,
+            realtime=FLAGS.realtime,
             game_steps_per_episode=FLAGS.game_steps_per_episode,
             disable_fog=FLAGS.disable_fog,
-            visualize=visualize) as env:
+            visualize=FLAGS.vis) as env:
         env = available_actions_printer.AvailableActionsPrinter(env)
 
-        # Initialize agents
-        agents = []
-        for i in range(AGENT_COUNT):
-            agent = SpicyAgent('agent%d' % i)
-            path = './save/%s.tf' % agent.name
-            if os.path.exists(path + '.index'):
-                print('Loading from file %s' % path)
-                agent.model.load_weights(path)
-            else:
-                print('Could not find file, randomly initilizaing model')
-            agents.append(agent)
+        if FLAGS.mode == 'play':
+            agent = random.choice(agents)
+            run_game_loop([agent], env)
+            if FLAGS.save_replay:
+                env.save_replay('./replays/%s_%s-%s_%s.SC2Replay' %
+                                (FLAGS.map, agent.name, 'human', datetime.now().strftime('%Y%m%d%H%M%S')))
+            return
 
         for gen in count(1):
             print('>>> Begin generation %d' % gen)
 
             # Full round robin
+            total_time = 0.
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
                 player1.reset()
                 player2.reset()
 
-                # 16 steps = 1 second of game time, running 1 frame every 8 steps is 2 frames per second
-                # End right before scenario timer or it sometimes crashes
                 print('>>> Start game loop between %s and %s' % (player1.name, player2.name))
-                run_scenario_loop([player1, player2], env)
+                total_time += run_game_loop([player1, player2], env)
 
-                print('>>> Train agents')
-                player1.train()
-                player2.train()
+                if FLAGS.mode == 'train':
+                    print('>>> Train agents')
+                    player1.train()
+                    player2.train()
 
-            for agent in agents:
-                agent.model.save_weights('./save/%s.tf' % agent.name)
+                if FLAGS.save_replay:
+                    env.save_replay('%s_%s-%s_%s.SC2Replay' %
+                                    (FLAGS.map, player1.name, player2.name, datetime.now().strftime('%Y%m%d%H%M%S')))
+
+            logging.critical('Generation %d complete - Average game time: %.2f' %
+                             (gen, total_time / (AGENT_COUNT ** 2 / 2 - AGENT_COUNT / 2)))
+
+            if FLAGS.mode == 'train':
+                for agent in agents:
+                    agent.model.save_weights('./save/%s.tf' % agent.name)
 
 
-def run_scenario_loop(agents, env, max_frames=0):
+def run_game_loop(agents, env, max_frames=0):
     total_frames = 0
     episode = 1
     start_time = time.time()
@@ -112,11 +118,10 @@ def run_scenario_loop(agents, env, max_frames=0):
     states = env.reset()
     while True:
         total_frames += 1
-        actions = [agent.step(state) for agent, state in zip(agents, states)]
+        actions = [agent.step(state, training=(FLAGS.mode == 'train')) for agent, state in zip(agents, states)]
         states = env.step(actions)
 
         if states[0].last() or states[1].last() or (max_frames and total_frames >= max_frames):
-            print('Detected end of game')
             if episode >= 1:
                 break
             episode += 1
@@ -125,30 +130,31 @@ def run_scenario_loop(agents, env, max_frames=0):
 
     elapsed_time = time.time() - start_time
     print("Took %.3f seconds at %.3f fps" % (elapsed_time, total_frames / elapsed_time))
+    return elapsed_time
 
 
 def main(unused_argv):
-
-    """Run an agent."""
-    if FLAGS.trace:
-        stopwatch.sw.trace()
-    elif FLAGS.profile:
-        stopwatch.sw.enable()
+    # Initialize agents
+    agents = []
+    for i in range(AGENT_COUNT):
+        agent = SpicyAgent('agent%d' % i)
+        path = './save/%s.tf' % agent.name
+        if os.path.exists(path + '.index'):
+            print('Loading from file %s' % path)
+            agent.model.load_weights(path)
+        else:
+            print('Could not find file, randomly initilizaing model')
+        agents.append(agent)
 
     players = [
         sc2_env.Agent(sc2_env.Race['terran'], 'player1'),
         sc2_env.Agent(sc2_env.Race['terran'], 'player2')
     ]
-
-    run(players, FLAGS.map, visualize=True)
-
-    if FLAGS.profile:
-        print(stopwatch.sw)
+    run(players, agents, FLAGS.map)
 
 
 if __name__ == "__main__":
-    # Good programming practice: Silence all warnings :P
-    warnings.filterwarnings("ignore")
+    logging.basicConfig(level=logging.CRITICAL, filename='train.log')
 
     # Register maps
     MapCM()
