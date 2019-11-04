@@ -11,7 +11,6 @@ from tensorflow.keras.optimizers import RMSprop, SGD
 from tensorflow.keras import Model
 
 import time
-import copy
 
 from spicy_config import *
 
@@ -22,16 +21,16 @@ class SpicyAgent:
     MAX_UNIT_SELECT = 5
 
     SCREEN_SIZE = 64
-    SCREEN_DEPTH = 9  # Number of screen views to use
-
-    ARG_COUNT = 8  # Size of arg tensor
-
     UNIT_TENSOR_LENGTH = 3
-
     SELECT_SIZE = 3
 
     VESPENE_SCALING = 1.5
     UNIT_HP_SCALE = 200  # 1600 by default
+
+    # Feature screens to use as spatial input
+    obs_screens = ['player_relative', 'unit_type', 'selected', 'unit_hit_points',
+                   'unit_hit_points_ratio', 'active', 'unit_density', 'unit_density_aa']
+    SCREEN_DEPTH = len(obs_screens)
 
     action_options = [
         {
@@ -84,17 +83,11 @@ class SpicyAgent:
         }
     ]
 
+    # Master list of units agent "knows about"
     unit_options = [
         units.Terran.Marine,
         units.Terran.Marauder,
         units.Terran.Hellion
-    ]
-
-    arg_options = [
-        'select_unit_id',
-        'select_add',
-        'select_unit_act',
-        'select_point_act',
     ]
 
     def __init__(self, name='agent'):
@@ -112,7 +105,6 @@ class SpicyAgent:
                                       self.SCREEN_DEPTH,
                                       self.UNIT_TENSOR_LENGTH,
                                       len(self.action_options))
-        self.model.summary()
         self.opt = RMSprop(lr=LEARNING_RATE)
 
         # How to convert blizzard unit and building IDs to our subset of units
@@ -191,7 +183,7 @@ class SpicyAgent:
     def step(self, obs, training=True):
         self.steps += 1
 
-        # Calculate reward of previous step and update it's state
+        # Calculate reward of previous step and update its state
         if self.steps != 1:
             reward = self.calc_reward(obs, self.recorder[-1].obs)
             self.recorder[-1].update(reward)
@@ -259,27 +251,23 @@ class SpicyAgent:
                   real_index,
                   screen_choice)
         )
-        # print("Action: %s, Args: %s" % (actions.FUNCTIONS[action_id].name, build_args))
+        # print("Action: %s, Args: %s" % (actions.FUNCTIONS[action['id']].name, build_args))
         return actions.FunctionCall(action['id'], build_args)
 
     def build_inputs_from_obs(self, obs):
-        # Subset of screens to use as inputs
-        screens = ['player_relative', 'unit_type', 'selected', 'unit_hit_points',
-                   'unit_hit_points_ratio', 'active', 'unit_density', 'unit_density_aa']
-
         screens_input = np.zeros((self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE), dtype=np.float32)
-        for ndx, name in enumerate(screens):
+        # Transpose feature screens because spatial observations are (y,x) coordinates, everything else is (x,y)
+        for ndx, name in enumerate(self.obs_screens):
             if name == 'player_relative':
-                screens_input[ndx] = self.convert_player_ids_vect(np.array(obs.observation['feature_screen'][name]))
+                screens_input[ndx] = self.convert_player_ids_vect(np.array(obs.observation['feature_screen'][name]).T)
             elif name == 'unit_type':
-                unit_types = np.array(obs.observation['feature_screen'][name])
+                unit_types = np.array(obs.observation['feature_screen'][name]).T
                 screens_input[ndx] = self.convert_unit_ids_vect(unit_types)
             elif name == 'unit_hit_points':
-                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]) / self.UNIT_HP_SCALE
+                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]).T / self.UNIT_HP_SCALE
             else:
-                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]) / getattr(features.SCREEN_FEATURES, name).scale
+                screens_input[ndx] = np.array(obs.observation['feature_screen'][name]).T / getattr(features.SCREEN_FEATURES, name).scale
 
-        # screens_input = screens_input.T
         screens_input = np.reshape(screens_input, (1, self.SCREEN_SIZE, self.SCREEN_SIZE, self.SCREEN_DEPTH))
 
         # Create screen-sized array to copy the non-spacial parts into
@@ -315,18 +303,18 @@ class SpicyAgent:
         if obs.last():
             return 0.
 
-        score = obs.observation['score_by_category'][1]
-        score_prev = obs_prev.observation['score_by_category'][1]
-        # Difference in killed minerals and vespene - diff in lost minerals and vespene since last state
-        diff_value = (score[1] - score_prev[1]) + self.VESPENE_SCALING*(score[2] - score_prev[2]) - \
-                     (score[3] - score_prev[3]) + self.VESPENE_SCALING*(score[4] - score_prev[4])
+        score = obs.observation['score_by_category']
+        score_prev = obs_prev.observation['score_by_category']
+        # Difference in army killed minerals and vespene cost minus diff in lost minerals and vespene since last state
+        diff_value = (score[1][1] - score_prev[1][1]) + self.VESPENE_SCALING*(score[2][1] - score_prev[2][1]) - \
+                     (score[3][1] - score_prev[3][1]) + self.VESPENE_SCALING*(score[4][1] - score_prev[4][1])
 
-        score = obs.observation['score_by_vital'][1]
-        score_prev = obs_prev.observation['score_by_vital'][1]
-        # Damage dealt - damage taken since last state
-        diff_damage = (score[0] - score_prev[0]) - (score[1] - score_prev[1])
+        score = obs.observation['score_by_vital']
+        score_prev = obs_prev.observation['score_by_vital']
+        # Difference in damage dealt minus damage taken since last state
+        diff_damage = (score[0][0] - score_prev[0][0]) - (score[1][0] - score_prev[1][0])
 
-        reward = .05 * (diff_value + .5*diff_damage)
+        reward = .1 * (diff_value + .5*diff_damage)
         # print('Change in reward: %.2f' % reward)
         return reward
 
@@ -369,7 +357,7 @@ class SpicyAgent:
 
 class State:
     def __init__(self, observation, inputs, outputs, ns_action, s_action):
-        self.obs = copy.deepcopy(observation)
+        self.obs = observation
         self.inputs = inputs
         self.outputs = outputs
         self.next_obs = None
