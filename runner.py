@@ -86,24 +86,40 @@ def run(players, agents, map_name):
 
             # Full round robin
             total_time = 0.
+            total_entropy = 0.
+            total_value_loss = 0.
+            total_policy_loss = 0.
+            games_played = 0
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
                 player1.reset()
                 player2.reset()
 
                 print('>>> Start game loop between %s and %s' % (player1.name, player2.name))
+                t_start = time.time()
                 total_time += run_game_loop([player1, player2], env)
+                print('Game completed in %.2fs' % (time.time() - t_start))
+                games_played += 1
 
                 if FLAGS.mode == 'train':
                     print('>>> Train agents')
-                    player1.train()
-                    player2.train()
+                    t_start = time.time()
+                    value_loss, policy_loss, entropy = player1.train()
+                    value_loss2, policy_loss2, entropy2 = player2.train()
+                    print('Training completed in %.2fs' % (time.time() - t_start))
+
+                    total_value_loss += value_loss + value_loss2
+                    total_policy_loss += policy_loss + policy_loss2
+                    total_entropy += entropy + entropy2
 
                 if FLAGS.save_replay:
                     env.save_replay('%s_%s-%s_%s.SC2Replay' %
                                     (FLAGS.map, player1.name, player2.name, datetime.now().strftime('%Y%m%d%H%M%S')))
 
-            logging.critical('Generation %d complete - Average game time: %.2f' %
-                             (gen, total_time / (AGENT_COUNT ** 2 / 2 - AGENT_COUNT / 2)))
+            logging.info('Generation %d complete' % gen)
+            logging.info('Average game time: %.2fs' % (total_time / games_played))
+            logging.info('Average value loss: %.3f' % (total_value_loss / (2*games_played)))
+            logging.info('Average policy loss: %.3f' % (total_policy_loss / (2*games_played)))
+            logging.info('Average entropy: %.3f' % (total_entropy / (2*games_played)))
 
             if FLAGS.mode == 'train':
                 for agent in agents:
@@ -154,7 +170,10 @@ def main(unused_argv):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.CRITICAL, filename='train.log')
+    absl_logger = logging.getLogger('absl')
+    absl_logger.setLevel(logging.ERROR)
+
+    logging.basicConfig(level=logging.INFO, filename='train.log')
 
     # Register maps
     MapCM()

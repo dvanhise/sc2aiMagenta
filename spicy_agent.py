@@ -10,15 +10,13 @@ from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concat
 from tensorflow.keras.optimizers import RMSprop, SGD
 from tensorflow.keras import Model
 
-import time
-
 from spicy_config import *
 
 
 class SpicyAgent:
 
     MAX_CONTROL_GROUPS = 3
-    MAX_UNIT_SELECT = 5
+    MAX_UNIT_SELECT = 3  # The highest index unit in a selection that can be selected individually
 
     SCREEN_SIZE = 64
     UNIT_TENSOR_LENGTH = 3
@@ -49,7 +47,7 @@ class SpicyAgent:
             'id': actions.FUNCTIONS.select_rect.id,
             'args': [1, 'screen_rect']
         },
-        # Every combination of set/recall/add option and control group id
+        # Every combination of control group action and group id
         # *({'id': actions.FUNCTIONS.select_control_group.id, 'args': [act, id]} for id in range(MAX_CONTROL_GROUPS) for act in range(3)),
         # Every combination of unit select options and unit to select
         *({'id': actions.FUNCTIONS.select_unit.id, 'args': [act, id]} for id in range(MAX_UNIT_SELECT) for act in range(4)),
@@ -65,10 +63,10 @@ class SpicyAgent:
             'id': actions.FUNCTIONS.Attack_screen.id,
             'args': [0, 'screen']
         },
-        {
-            'id': actions.FUNCTIONS.Cancel_quick.id,
-            'args': [0]
-        },
+        # {
+        #     'id': actions.FUNCTIONS.Cancel_quick.id,
+        #     'args': [0]
+        # },
         {
             'id': actions.FUNCTIONS.Move_screen.id,
             'args': [0, 'screen']
@@ -133,26 +131,28 @@ class SpicyAgent:
 
     # Train model with game data in self.recorder
     def train(self):
-        t1 = time.time()
-        # Update all rewards to discounted rewards
+        # Calculate discounted rewards working backwards
+        # Maybe also incorporate penalty for time taken and win/loss in final reward calculation
         discounted_reward = 0
+        rewards = []
         for state in reversed(self.recorder):
-            state.reward = state.reward + DISCOUNT_RATE * discounted_reward
+            discounted_reward = state.reward + DISCOUNT_RATE * discounted_reward
+            rewards.append(discounted_reward)
+        rewards = list(reversed(rewards))
 
-        self.train_batch(
+        return self.train_batch(
             self.strip_reshape(np.array([state.inputs[0] for state in self.recorder])),
             self.strip_reshape(np.array([state.inputs[1] for state in self.recorder])),
-            np.array([state.reward for state in self.recorder], dtype=np.float32),
+            np.array(rewards, dtype=np.float32),
             np.array([state.ns_action for state in self.recorder]),
             np.array([state.s_action for state in self.recorder])
         )
-        print('Training round complete for %s, time taken: %.1f' % (self.name, time.time() - t1))
 
     def train_batch(self, input1, input2, reward, action, screen_action):
+        _entropy = _policy_loss = _value_loss = 0.
         with tf.GradientTape() as tape:
             spatial_policy, ns_policy, value = self.model([input1, input2])
             ns_policy = K.softmax(ns_policy)
-            # spatial_policy = K.flatten(spatial_policy)
 
             action_one_hot = K.one_hot(action, len(self.action_options))
             screen_action_one_hot = K.one_hot(screen_action, self.SCREEN_SIZE * self.SCREEN_SIZE)
@@ -162,10 +162,15 @@ class SpicyAgent:
             entropy = K.sum(ns_policy * K.log(ns_policy + 1e-10)) + \
                       K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
             value_loss = KL.mean_squared_error(value, reward)
-            policy_loss = KL.categorical_crossentropy(action_one_hot, ns_policy, from_logits=True) * \
-                          KL.categorical_crossentropy(screen_action_one_hot, spatial_policy, from_logits=True) * \
-                          advantage
+            # Should that negative on policy loss be there?
+            policy_loss = -(KL.categorical_crossentropy(action_one_hot, ns_policy, from_logits=True) *
+                            KL.categorical_crossentropy(screen_action_one_hot, spatial_policy, from_logits=True) *
+                            advantage)
             total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
+
+            _entropy = K.mean(entropy)
+            _policy_loss = K.mean(policy_loss)
+            _value_loss = K.mean(value_loss)
 
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
 
@@ -175,6 +180,8 @@ class SpicyAgent:
         #         raise ValueError('NaN found in gradient')
 
         self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
+
+        return float(_value_loss), float(_policy_loss), float(_entropy)
 
     def strip_reshape(self, arr):
         return np.reshape(arr, tuple(s for s in arr.shape if s > 1))
