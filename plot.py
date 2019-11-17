@@ -37,7 +37,7 @@ plt.xlabel('Generation')
 plt.title('Entropy')
 plt.show()
 
-plt.plot(range(len(policy)), [-p for p in policy], 'bo')
+plt.plot(range(len(policy)), policy, 'bo')
 plt.ylabel('Mean Policy Loss')
 plt.xlabel('Generation')
 plt.title('Policy Loss')

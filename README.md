@@ -1,5 +1,5 @@
 ## MagentaAI
-Trains AI agents to play a micro focused SC2 minigame.
+Trains AI agents using reinforcement learning to play a micro focused Starcraft 2 minigame in the pysc2 environment.
 
 ### Requirements:
 * Install Starcraft 2: Legacy of the Void and set environment variable *SC2PATH* to the install directory

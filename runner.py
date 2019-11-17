@@ -4,9 +4,11 @@ import os
 import logging
 from datetime import datetime
 import random
+import numpy as np
 
 from absl import app
 from absl import flags
+import matplotlib.pyplot as plt
 
 from pysc2.env import available_actions_printer, sc2_env
 from pysc2.lib import point_flag, stopwatch
@@ -111,6 +113,9 @@ def run(players, agents, map_name):
                     total_policy_loss += policy_loss + policy_loss2
                     total_entropy += entropy + entropy2
 
+                make_reward_plot(player2, save=True)
+                make_action_plot(player2, save=True)
+
                 if FLAGS.save_replay:
                     env.save_replay('%s_%s-%s_%s.SC2Replay' %
                                     (FLAGS.map, player1.name, player2.name, datetime.now().strftime('%Y%m%d%H%M%S')))
@@ -149,7 +154,45 @@ def run_game_loop(agents, env, max_frames=0):
     return elapsed_time
 
 
+def make_action_plot(agent, save=False):
+    action_probs = np.sum([(np.exp(state.outputs[1]) / np.sum(np.exp(state.outputs[1]))) for state in agent.recorder], axis=0)
+    action_probs /= len(agent.recorder)
+
+    plt.clf()
+    plt.plot(range(len(action_probs)), action_probs, 'bo', markersize=2)
+    plt.ylabel('Mean Probability')
+    plt.xlabel('Action Index')
+    plt.title('%s Action Probabilities' % agent.name)
+    plt.yscale('log')
+    if save:
+        plt.savefig('action_fig.png')
+    else:
+        plt.show()
+
+
+def make_reward_plot(agent, save=False):
+    values = [float(state.outputs[2]) for state in agent.recorder]
+    discounted_rewards = agent.get_discounted_rewards()
+    rewards = [state.reward for state in agent.recorder]
+
+    plt.clf()
+    plt.plot(range(len(agent.recorder)), values, 'bo', markersize=2)
+    plt.plot(range(len(agent.recorder)), rewards, 'ro', markersize=2)
+    plt.plot(range(len(agent.recorder)), discounted_rewards, 'go', markersize=2)
+    plt.ylabel('Value/Reward')
+    plt.xlabel('Step')
+    plt.title('%s Predicted Value and Reward' % agent.name)
+    plt.legend(['Value', 'Reward', 'Discounted Reward'])
+    if save:
+        plt.savefig('reward_fig.png')
+    else:
+        plt.show()
+
+
 def main(unused_argv):
+    # SpicyAgent().model.summary()
+    # return
+
     # Initialize agents
     agents = []
     for i in range(AGENT_COUNT):

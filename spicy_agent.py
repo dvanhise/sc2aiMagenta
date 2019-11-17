@@ -6,7 +6,8 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.keras.backend as K
 import tensorflow.keras.losses as KL
-from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape, Input, LSTM
+from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape, Input, LSTM, \
+    BatchNormalization, Activation, Lambda, Dropout, ConvLSTM2D
 from tensorflow.keras.optimizers import RMSprop, SGD
 from tensorflow.keras import Model
 
@@ -16,13 +17,13 @@ from spicy_config import *
 class SpicyAgent:
 
     MAX_CONTROL_GROUPS = 3
-    MAX_UNIT_SELECT = 3  # The highest index unit in a selection that can be selected individually
+    MAX_UNIT_SELECT = 5  # The highest index unit in a selection that can be selected individually
 
     SCREEN_SIZE = 64
     UNIT_TENSOR_LENGTH = 3
-    SELECT_SIZE = 3
+    SELECT_SIZE = 4  # Default radius of select rect
 
-    VESPENE_SCALING = 1.5
+    VESPENE_SCALING = 1.25
     UNIT_HP_SCALE = 200  # 1600 by default
 
     # Feature screens to use as spatial input
@@ -50,7 +51,7 @@ class SpicyAgent:
         # Every combination of control group action and group id
         # *({'id': actions.FUNCTIONS.select_control_group.id, 'args': [act, id]} for id in range(MAX_CONTROL_GROUPS) for act in range(3)),
         # Every combination of unit select options and unit to select
-        *({'id': actions.FUNCTIONS.select_unit.id, 'args': [act, id]} for id in range(MAX_UNIT_SELECT) for act in range(4)),
+        *({'id': actions.FUNCTIONS.select_unit.id, 'args': [act, id]} for id in range(MAX_UNIT_SELECT) for act in range(2)),
         {
             'id': actions.FUNCTIONS.select_army.id,
             'args': [0]
@@ -129,29 +130,33 @@ class SpicyAgent:
         self.steps = 0
         self.episodes += 1
 
-    # Train model with game data in self.recorder
-    def train(self):
-        # Calculate discounted rewards working backwards
-        # Maybe also incorporate penalty for time taken and win/loss in final reward calculation
+    def get_discounted_rewards(self):
         discounted_reward = 0
         rewards = []
+        # Maybe also incorporate penalty for time taken and win/loss in final reward calculation
+        # Calculate discounted rewards working backwards
         for state in reversed(self.recorder):
             discounted_reward = state.reward + DISCOUNT_RATE * discounted_reward
             rewards.append(discounted_reward)
         rewards = list(reversed(rewards))
+        return rewards
 
-        return self.train_batch(
+    # Train model with game data in self.recorder
+    def train(self):
+        return self._train(
             self.strip_reshape(np.array([state.inputs[0] for state in self.recorder])),
             self.strip_reshape(np.array([state.inputs[1] for state in self.recorder])),
-            np.array(rewards, dtype=np.float32),
+            self.strip_reshape(np.array([state.inputs[2] for state in self.recorder])),
+            np.array(self.get_discounted_rewards(), dtype=np.float32),
             np.array([state.ns_action for state in self.recorder]),
             np.array([state.s_action for state in self.recorder])
         )
 
-    def train_batch(self, input1, input2, reward, action, screen_action):
+    def _train(self, screens_input, action_input, select_input, reward, action, screen_action):
         _entropy = _policy_loss = _value_loss = 0.
+
         with tf.GradientTape() as tape:
-            spatial_policy, ns_policy, value = self.model([input1, input2])
+            spatial_policy, ns_policy, value = self.model([screens_input, action_input, select_input])
             ns_policy = K.softmax(ns_policy)
 
             action_one_hot = K.one_hot(action, len(self.action_options))
@@ -159,13 +164,12 @@ class SpicyAgent:
 
             advantage = reward - value
 
-            entropy = K.sum(ns_policy * K.log(ns_policy + 1e-10)) + \
+            entropy = -K.sum(ns_policy * K.log(ns_policy + 1e-10)) - \
                       K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
-            value_loss = KL.mean_squared_error(value, reward)
-            # Should that negative on policy loss be there?
-            policy_loss = -(KL.categorical_crossentropy(action_one_hot, ns_policy, from_logits=True) *
-                            KL.categorical_crossentropy(screen_action_one_hot, spatial_policy, from_logits=True) *
-                            advantage)
+            value_loss = KL.mean_squared_error(reward, value)
+            policy_loss = -advantage * (KL.categorical_crossentropy(action_one_hot, ns_policy, from_logits=True) +
+                                       KL.categorical_crossentropy(screen_action_one_hot, spatial_policy, from_logits=True))
+            # Goal is to reduce policy and value loss, increase entropy.
             total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
 
             _entropy = K.mean(entropy)
@@ -195,8 +199,9 @@ class SpicyAgent:
             reward = self.calc_reward(obs, self.recorder[-1].obs)
             self.recorder[-1].update(reward)
 
-        screens_input, ns_input = self.build_inputs_from_obs(obs)
-        spatial_action_policy, ns_action_policy, value = self.model([screens_input, ns_input])
+        screens_input, action_input, select_input = self.build_inputs_from_obs(obs)
+        # print('Shapes: %s   %s   %s' % (screens_input.shape, action_input.shape, select_input.shape))
+        spatial_action_policy, ns_action_policy, value = self.model([screens_input, action_input, select_input])
         # print('shape: %s  %s' % (spatial_action_policy.shape, ns_action_policy.shape))
 
         if np.any(np.isnan(ns_action_policy)) or np.any(np.isnan(spatial_action_policy)):
@@ -253,7 +258,7 @@ class SpicyAgent:
 
         self.recorder.append(
             State(obs,
-                  (screens_input, ns_input),
+                  (screens_input, action_input, select_input),
                   (spatial_action_policy, ns_action_policy, value),
                   real_index,
                   screen_choice)
@@ -277,16 +282,12 @@ class SpicyAgent:
 
         screens_input = np.reshape(screens_input, (1, self.SCREEN_SIZE, self.SCREEN_SIZE, self.SCREEN_DEPTH))
 
-        # Create screen-sized array to copy the non-spacial parts into
-        ns_input = np.zeros((self.SCREEN_SIZE, 3))
-
-        # Available actions
-        act_count = len(self.action_options)
-        act_input = np.zeros((act_count, self.UNIT_TENSOR_LENGTH))
-        available_actions = obs.observation['available_actions']
-        for ndx, act_info in enumerate(self.action_options):
-            act_input[ndx, 0:self.UNIT_TENSOR_LENGTH] = (1. if act_info['id'] in available_actions else 0.)
-        ns_input[0:act_count, 0:self.UNIT_TENSOR_LENGTH] = act_input
+        # Available actions as array of 1 and 0
+        action_input = np.array([
+            (1. if act_info['id'] in obs.observation['available_actions'] else 0.)
+            for act_info in self.action_options
+        ], dtype=np.float32)
+        action_input = np.reshape(action_input, (1, len(self.action_options)))
 
         # Normalizes the unit select tensor and removes fields
         def convert_select_tensor(x):
@@ -297,14 +298,15 @@ class SpicyAgent:
             ], dtype=np.float32)
 
         # Selected units
+        select_input = np.zeros((self.MAX_UNIT_SELECT, self.UNIT_TENSOR_LENGTH), dtype=np.float32)
         for ndx, unit in enumerate(obs.observation['multi_select']):
-            ns_input[act_count + ndx:act_count + ndx + 1, 0:self.UNIT_TENSOR_LENGTH] = convert_select_tensor(unit)
-        ns_input = np.reshape(ns_input, (1, self.SCREEN_SIZE, 3))
+            select_input[ndx] = convert_select_tensor(unit)
+        select_input = np.reshape(select_input, (1, self.MAX_UNIT_SELECT * self.UNIT_TENSOR_LENGTH))
 
-        if np.isin(np.NaN, ns_input) or np.isin(np.NaN, screens_input):
-            raise ValueError('NaN found in input tensor')
+        # if np.isin(np.NaN, screens_input) or np.isin(np.NaN, select_input):
+        #     raise ValueError('NaN found in input tensor')
 
-        return screens_input, ns_input
+        return screens_input, action_input, select_input
 
     def calc_reward(self, obs, obs_prev):
         if obs.last():
@@ -321,43 +323,60 @@ class SpicyAgent:
         # Difference in damage dealt minus damage taken since last state
         diff_damage = (score[0][0] - score_prev[0][0]) - (score[1][0] - score_prev[1][0])
 
-        reward = .1 * (diff_value + .5*diff_damage)
+        reward = .05 * (diff_value + diff_damage)
         # print('Change in reward: %.2f' % reward)
         return reward
 
-    def build_model(self, screen_width, screen_height, screen_depth, ns_input_length, action_size):
+    def build_model(self, screen_width, screen_height, screen_depth, select_input_length, action_size, training=True):
         K.set_floatx('float32')
 
         # Inputs
         screen_input = Input(shape=(screen_width, screen_height, screen_depth), dtype='float32')
-        ns_input = Input(shape=(screen_width, ns_input_length), dtype='float32')
+        action_input = Input(shape=(action_size,), dtype='float32')
+        select_input = Input(shape=(self.MAX_UNIT_SELECT * select_input_length,), dtype='float32')
 
-        screen = Conv2D(screen_depth, 5, strides=1, padding='same', activation='relu')(screen_input)
-        screen = Conv2D(2*screen_depth, 3, strides=1, padding='same', activation='relu')(screen)
-        # screen = MaxPooling2D()(screen)
+        screen_1 = Conv2D(screen_depth, 5, strides=1, padding='same')(screen_input)
+        screen_1 = BatchNormalization()(screen_1)
+        screen_1 = Activation('relu')(screen_1)
+        # if training:
+        #     screen_1 = Dropout(DROPOUT_RATE)(screen_1)
+        screen_1 = Conv2D(screen_depth, 3, strides=1, padding='same', activation='relu')(screen_1)
 
-        ns = Dense(screen_height, use_bias=True, activation='relu')(ns_input)
-        ns = Reshape((screen_width, screen_height, 1,))(ns)
+        action_1 = Dense(screen_width*screen_height, use_bias=True, activation='relu', name='Ingrid')(action_input)
+        action_1 = Reshape((screen_width, screen_height, 1))(action_1)
 
-        state = Concatenate(axis=3)([screen, ns])
+        select_1 = Dense(screen_width*screen_height, use_bias=True, name='Steve')(select_input)
+        select_1 = BatchNormalization()(select_1)
+        select_1 = Activation('relu')(select_1)
+        # if training:
+        #     select_1 = Dropout(DROPOUT_RATE)(select_1)
+        select_1 = Reshape((screen_width, screen_height, 1))(select_1)
 
-        spatial_action_policy = Conv2D(1, 3, padding='same', activation='softmax')(state)
-        # spatial_action_policy = Reshape((screen_width, screen_height))(spatial_action_policy)
-        # spatial_action_policy = LSTM(256)(spatial_action_policy)
-        spatial_action_policy = Flatten()(spatial_action_policy)
+        core = Concatenate(axis=3)([screen_1, action_1, select_1])
+        # TODO: How the hell do I give time series data to this and also run individual steps
+        # core = ConvLSTM2D(1, 5, strides=1, padding='same', activation='relu', training=training)(core)
+        core = Conv2D(4, 5, strides=1, padding='same', activation='relu')(core)
 
-        state_ns = Conv2D(1, 5, strides=3, padding='valid', activation='relu')(state)
-        state_ns = Flatten()(state_ns)
-        state_ns = Dense(32, use_bias=False, activation='relu')(state_ns)
+        action_policy = Conv2D(1, 3, strides=2, padding='same', activation='relu')(core)
+        action_policy = Flatten()(action_policy)
+        action_policy = Dense(action_size, use_bias=True, name='Barb')(action_policy)
+        action_policy = Reshape((action_size,))(action_policy)
 
-        ns_action_policy = Dense(action_size * 2, use_bias=True)(state_ns)
-        ns_action_policy = Reshape((action_size * 2, 1))(ns_action_policy)
-        ns_action_policy = LSTM(action_size)(ns_action_policy)
-        ns_action_policy = Reshape((action_size,))(ns_action_policy)
+        value = Conv2D(1, 5, strides=3)(core)
+        value = BatchNormalization()(value)
+        value = Activation('relu')(value)
+        value = Flatten()(value)
+        value = Dense(1)(value)
 
-        value = Dense(1, use_bias=True)(state_ns)
+        # Concat the chosen action policy so screen policy is action aware
+        action_policy_dense = Dense(screen_width*screen_height, use_bias=True, activation='relu')(action_policy)
+        action_policy_dense = Reshape((screen_width, screen_height, 1))(action_policy_dense)
+        screen_core = Concatenate(axis=3)([core, action_policy_dense])
 
-        model = Model([screen_input, ns_input], [spatial_action_policy, ns_action_policy, value])
+        screen_policy = Conv2D(1, 3, padding='same', activation='softmax')(screen_core)
+        screen_policy = Flatten()(screen_policy)
+
+        model = Model([screen_input, action_input, select_input], [screen_policy, action_policy, value])
 
         return model
 
