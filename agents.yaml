@@ -1,0 +1,55 @@
+agents:
+  - name: NormalAgent
+    weights:
+      enemy_killed_value: 1
+      friendly_killed_value: 1
+      killed_value: 1
+      damage_taken: 1
+      damage_given: 1
+      damage: 1
+      outcome: 1
+  - name: SemiBloodthirsty
+    weights:
+      enemy_killed_value: 1
+      friendly_killed_value: .9
+      killed_value: 1
+      damage_given: 1
+      damage_taken: .9
+      damage: 1
+      outcome: 1
+  - name: Bloodthirsty
+    weights:
+      enemy_killed_value: 1
+      friendly_killed_value: .75
+      killed_value: 1
+      damage_given: 1
+      damage_taken: .75
+      damage: 1
+      outcome: 1
+  - name: HighOutcome
+    weights:
+      enemy_killed_value: 1
+      friendly_killed_value: 1
+      killed_value: .1
+      damage_taken: 1
+      damage_given: 1
+      damage: .1
+      outcome: 1
+  - name: KillsOnly
+    weights:
+      enemy_killed_value: 1
+      friendly_killed_value: 1
+      killed_value: 1
+      damage_taken: 0
+      damage_given: 0
+      damage: 0
+      outcome: 1
+  - name: DamageOnly
+    weights:
+      enemy_killed_value: 0
+      friendly_killed_value: 0
+      killed_value: 0
+      damage_taken: 1
+      damage_given: 1
+      damage: 1
+      outcome: 1

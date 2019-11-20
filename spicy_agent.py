@@ -5,7 +5,6 @@ from pysc2.lib import features
 import numpy as np
 import tensorflow as tf
 import tensorflow.keras.backend as K
-import tensorflow.keras.losses as KL
 from tensorflow.keras.layers import Dense, Conv2D, Flatten, MaxPooling2D, Concatenate, Reshape, Input, LSTM, \
     BatchNormalization, Activation, Lambda, Dropout, ConvLSTM2D
 from tensorflow.keras.optimizers import RMSprop, SGD
@@ -50,7 +49,7 @@ class SpicyAgent:
         },
         # Every combination of control group action and group id
         # *({'id': actions.FUNCTIONS.select_control_group.id, 'args': [act, id]} for id in range(MAX_CONTROL_GROUPS) for act in range(3)),
-        # Every combination of unit select options and unit to select
+        # select_unit_act options: Select, deselect, select all of type, deselect all of type
         *({'id': actions.FUNCTIONS.select_unit.id, 'args': [act, id]} for id in range(MAX_UNIT_SELECT) for act in range(2)),
         {
             'id': actions.FUNCTIONS.select_army.id,
@@ -89,11 +88,24 @@ class SpicyAgent:
         units.Terran.Hellion
     ]
 
-    def __init__(self, name='agent'):
+    def __init__(self, name='agent', reward_weights=None):
         self.reward = 0
         self.episodes = 0
         self.steps = 0
         self.name = name
+
+        # Default reward weights
+        self.reward_weights = {
+            'enemy_killed_value': 1,
+            'friendly_killed_value': 1,
+            'killed_value': 1,
+            'damage_taken': 1,
+            'damage_given': 1,
+            'damage': 1,
+            'outcome': 1,
+        }
+        if reward_weights:
+            self.reward_weights.update(reward_weights)
         self.obs_spec = None
         self.action_spec = None
 
@@ -133,7 +145,6 @@ class SpicyAgent:
     def get_discounted_rewards(self):
         discounted_reward = 0
         rewards = []
-        # Maybe also incorporate penalty for time taken and win/loss in final reward calculation
         # Calculate discounted rewards working backwards
         for state in reversed(self.recorder):
             discounted_reward = state.reward + DISCOUNT_RATE * discounted_reward
@@ -159,36 +170,37 @@ class SpicyAgent:
             spatial_policy, ns_policy, value = self.model([screens_input, action_input, select_input])
             ns_policy = K.softmax(ns_policy)
 
-            action_one_hot = K.one_hot(action, len(self.action_options))
+            ns_action_one_hot = K.one_hot(action, len(self.action_options))
             screen_action_one_hot = K.one_hot(screen_action, self.SCREEN_SIZE * self.SCREEN_SIZE)
 
-            advantage = reward - value
+            advantage = reward - K.stop_gradient(value)
 
             entropy = -K.sum(ns_policy * K.log(ns_policy + 1e-10)) - \
-                      K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
-            value_loss = KL.mean_squared_error(reward, value)
-            policy_loss = -advantage * (KL.categorical_crossentropy(action_one_hot, ns_policy, from_logits=True) +
-                                       KL.categorical_crossentropy(screen_action_one_hot, spatial_policy, from_logits=True))
-            # Goal is to reduce policy and value loss, increase entropy.
+                       K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
+            value_loss = 20 * K.mean(K.square(reward - value))
+
+            ns_log_prob = K.log(K.mean(ns_policy * ns_action_one_hot))
+            spatial_log_prob = K.log(K.mean(spatial_policy * screen_action_one_hot))
+            policy_loss = -(ns_log_prob + spatial_log_prob) * advantage
+
             total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
 
             _entropy = K.mean(entropy)
-            _policy_loss = K.mean(policy_loss)
+            _policy_loss = K.mean(K.abs(policy_loss))
             _value_loss = K.mean(value_loss)
 
         gradients = tape.gradient(total_loss, self.model.trainable_variables)
-
-        # capped_gradients = [K.clip(grad, -1., 1.) for grad in gradients]
-        # for grad in gradients:
-        #     if np.any(np.isnan(grad)):
-        #         raise ValueError('NaN found in gradient')
-
         self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
 
         return float(_value_loss), float(_policy_loss), float(_entropy)
 
     def strip_reshape(self, arr):
         return np.reshape(arr, tuple(s for s in arr.shape if s > 1))
+
+    # Call with game end step and the outcome from the environment
+    def step_end(self, obs, outcome):
+        reward = self.calc_reward(obs, self.recorder[-1].obs, outcome=outcome)
+        self.recorder[-1].update(reward)
 
     # Takes a state and returns an action, also updates step information
     def step(self, obs, training=True):
@@ -200,12 +212,7 @@ class SpicyAgent:
             self.recorder[-1].update(reward)
 
         screens_input, action_input, select_input = self.build_inputs_from_obs(obs)
-        # print('Shapes: %s   %s   %s' % (screens_input.shape, action_input.shape, select_input.shape))
         spatial_action_policy, ns_action_policy, value = self.model([screens_input, action_input, select_input])
-        # print('shape: %s  %s' % (spatial_action_policy.shape, ns_action_policy.shape))
-
-        if np.any(np.isnan(ns_action_policy)) or np.any(np.isnan(spatial_action_policy)):
-            raise ValueError('NaN found in output tensor')
 
         # Remove dimensions with length 1
         spatial_action_policy = self.strip_reshape(spatial_action_policy)
@@ -230,8 +237,6 @@ class SpicyAgent:
 
         # Compute softmax with unavailable actions removed, normalize again to get around numpy random choice bug
         action_probs = np.exp(action_probs) / np.sum(np.exp(action_probs))
-        # action_probs = np.array(tf.math.softmax(action_probs))
-        # action_probs /= action_probs.sum()
 
         if training:
             # Select from probability distribution
@@ -265,6 +270,7 @@ class SpicyAgent:
         )
         # print("Action: %s, Args: %s" % (actions.FUNCTIONS[action['id']].name, build_args))
         return actions.FunctionCall(action['id'], build_args)
+        # return actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
 
     def build_inputs_from_obs(self, obs):
         screens_input = np.zeros((self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE), dtype=np.float32)
@@ -303,28 +309,32 @@ class SpicyAgent:
             select_input[ndx] = convert_select_tensor(unit)
         select_input = np.reshape(select_input, (1, self.MAX_UNIT_SELECT * self.UNIT_TENSOR_LENGTH))
 
-        # if np.isin(np.NaN, screens_input) or np.isin(np.NaN, select_input):
-        #     raise ValueError('NaN found in input tensor')
-
         return screens_input, action_input, select_input
 
-    def calc_reward(self, obs, obs_prev):
-        if obs.last():
-            return 0.
+    def calc_reward(self, obs, obs_prev, outcome=0.):
+        # action_result = obs.observation['action_result']
+        # if action_result == 1:   # Success
+        #     action_reward = .001
+        # else:
+        #     action_reward = -.001
+        rw = self.reward_weights
 
         score = obs.observation['score_by_category']
         score_prev = obs_prev.observation['score_by_category']
         # Difference in army killed minerals and vespene cost minus diff in lost minerals and vespene since last state
-        diff_value = (score[1][1] - score_prev[1][1]) + self.VESPENE_SCALING*(score[2][1] - score_prev[2][1]) - \
-                     (score[3][1] - score_prev[3][1]) + self.VESPENE_SCALING*(score[4][1] - score_prev[4][1])
+        enemy_killed_value = (score[1][1] - score_prev[1][1]) + self.VESPENE_SCALING*(score[2][1] - score_prev[2][1])
+        friendly_killed_value = (score[3][1] - score_prev[3][1]) + self.VESPENE_SCALING*(score[4][1] - score_prev[4][1])
+        diff_value = rw['enemy_killed_value'] * enemy_killed_value - rw['friendly_killed_value'] * friendly_killed_value
 
         score = obs.observation['score_by_vital']
         score_prev = obs_prev.observation['score_by_vital']
         # Difference in damage dealt minus damage taken since last state
-        diff_damage = (score[0][0] - score_prev[0][0]) - (score[1][0] - score_prev[1][0])
+        damage_given = score[0][0] - score_prev[0][0]
+        damage_taken = score[1][0] - score_prev[1][0]
 
-        reward = .05 * (diff_value + diff_damage)
-        # print('Change in reward: %.2f' % reward)
+        diff_damage = rw['damage_given'] * damage_given - rw['damage_taken'] * damage_taken
+
+        reward = .005 * rw['killed_value'] * diff_value + .01 * rw['damage'] * diff_damage + rw['outcome'] * outcome
         return reward
 
     def build_model(self, screen_width, screen_height, screen_depth, select_input_length, action_size, training=True):

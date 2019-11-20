@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 import random
 import numpy as np
+import yaml
 
 from absl import app
 from absl import flags
@@ -72,8 +73,8 @@ def run(players, agents, map_name):
             realtime=FLAGS.realtime,
             game_steps_per_episode=FLAGS.game_steps_per_episode,
             disable_fog=FLAGS.disable_fog,
-            visualize=FLAGS.vis) as env:
-        env = available_actions_printer.AvailableActionsPrinter(env)
+            visualize=FLAGS.vis) as main_env:
+        env = available_actions_printer.AvailableActionsPrinter(main_env)
 
         if FLAGS.mode == 'play':
             agent = random.choice(agents)
@@ -98,7 +99,7 @@ def run(players, agents, map_name):
 
                 print('>>> Start game loop between %s and %s' % (player1.name, player2.name))
                 t_start = time.time()
-                total_time += run_game_loop([player1, player2], env)
+                total_time += run_game_loop([player1, player2], env, main_env)
                 print('Game completed in %.2fs' % (time.time() - t_start))
                 games_played += 1
 
@@ -113,7 +114,9 @@ def run(players, agents, map_name):
                     total_policy_loss += policy_loss + policy_loss2
                     total_entropy += entropy + entropy2
 
+                make_reward_plot(player1, save=True)
                 make_reward_plot(player2, save=True)
+                make_action_plot(player1, save=True)
                 make_action_plot(player2, save=True)
 
                 if FLAGS.save_replay:
@@ -124,16 +127,15 @@ def run(players, agents, map_name):
             logging.info('Average game time: %.2fs' % (total_time / games_played))
             logging.info('Average value loss: %.3f' % (total_value_loss / (2*games_played)))
             logging.info('Average policy loss: %.3f' % (total_policy_loss / (2*games_played)))
-            logging.info('Average entropy: %.3f' % (total_entropy / (2*games_played)))
+            logging.info('Average entropy: %.3f' % (total_entropy / (2*games_played*total_time)))
 
             if FLAGS.mode == 'train':
                 for agent in agents:
                     agent.model.save_weights('./save/%s.tf' % agent.name)
 
 
-def run_game_loop(agents, env, max_frames=0):
+def run_game_loop(agents, env, main_env):
     total_frames = 0
-    episode = 1
     start_time = time.time()
 
     states = env.reset()
@@ -142,12 +144,22 @@ def run_game_loop(agents, env, max_frames=0):
         actions = [agent.step(state, training=(FLAGS.mode == 'train')) for agent, state in zip(agents, states)]
         states = env.step(actions)
 
-        if states[0].last() or states[1].last() or (max_frames and total_frames >= max_frames):
-            if episode >= 1:
-                break
-            episode += 1
-            total_frames = 0
-            states = env.reset()
+        if states[0].last() or states[1].last():
+            # Step one last time to update rewards
+            for agent, state, obs in zip(agents, states, main_env._obs):
+                outcome = 0
+                for result in obs.player_result:
+                    if result.player_id == obs.observation.player_common.player_id:
+                        if result.result == 1:  # Victory
+                            outcome = 1
+                        elif result.result == 2:  # Defeat
+                            outcome = -1
+                        else:
+                            raise ValueError('Invalid game result')
+                        break
+                agent.step_end(state, outcome=outcome)
+
+            break
 
     elapsed_time = time.time() - start_time
     print("Took %.3f seconds at %.3f fps" % (elapsed_time, total_frames / elapsed_time))
@@ -165,7 +177,7 @@ def make_action_plot(agent, save=False):
     plt.title('%s Action Probabilities' % agent.name)
     plt.yscale('log')
     if save:
-        plt.savefig('action_fig.png')
+        plt.savefig('figures/action_fig_%s.png' % agent.name)
     else:
         plt.show()
 
@@ -184,7 +196,7 @@ def make_reward_plot(agent, save=False):
     plt.title('%s Predicted Value and Reward' % agent.name)
     plt.legend(['Value', 'Reward', 'Discounted Reward'])
     if save:
-        plt.savefig('reward_fig.png')
+        plt.savefig('figures/reward_fig_%s.png' % agent.name)
     else:
         plt.show()
 
@@ -192,6 +204,21 @@ def make_reward_plot(agent, save=False):
 def main(unused_argv):
     # SpicyAgent().model.summary()
     # return
+
+    # with open('agents.yaml', 'r') as f:
+    #     agents_data = yaml.safe_load(f)
+    #
+    # # Initialize agents
+    # agents = []
+    # for data in agents_data['agents']:
+    #     agent = SpicyAgent(data['name'], data['weights'])
+    #     path = './save/%s.tf' % agent.name
+    #     if os.path.exists(path + '.index'):
+    #         print('Loading from file %s' % path)
+    #         agent.model.load_weights(path)
+    #     else:
+    #         print('Could not find file, randomly initilizaing model')
+    #     agents.append(agent)
 
     # Initialize agents
     agents = []
