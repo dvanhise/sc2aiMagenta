@@ -90,7 +90,7 @@ class SpicyAgent:
 
     def __init__(self, name='agent', reward_weights=None):
         self.reward = 0
-        self.episodes = 0
+        self.episode = 0
         self.steps = 0
         self.name = name
 
@@ -140,67 +140,79 @@ class SpicyAgent:
     def reset(self):
         self.recorder = []
         self.steps = 0
-        self.episodes += 1
+        self.episode = 0
 
-    def get_discounted_rewards(self):
+    def start_episode(self):
+        if self.steps > 0:  # If an episode has been in progress
+            self.episode += 1
+        self.steps = 0
+        self.recorder.append([])
+
+    def get_discounted_rewards(self, rewards):
         discounted_reward = 0
-        rewards = []
+        discounted_rewards = []
         # Calculate discounted rewards working backwards
-        for state in reversed(self.recorder):
-            discounted_reward = state.reward + DISCOUNT_RATE * discounted_reward
-            rewards.append(discounted_reward)
-        rewards = list(reversed(rewards))
-        return rewards
+        for reward in reversed(rewards):
+            discounted_reward = reward + DISCOUNT_RATE * discounted_reward
+            discounted_rewards.append(discounted_reward)
+        discounted_rewards = list(reversed(discounted_rewards))
+        return discounted_rewards
 
-    # Train model with game data in self.recorder
+    # Train model with recorded game data
     def train(self):
-        return self._train(
-            self.strip_reshape(np.array([state.inputs[0] for state in self.recorder])),
-            self.strip_reshape(np.array([state.inputs[1] for state in self.recorder])),
-            self.strip_reshape(np.array([state.inputs[2] for state in self.recorder])),
-            np.array(self.get_discounted_rewards(), dtype=np.float32),
-            np.array([state.ns_action for state in self.recorder]),
-            np.array([state.s_action for state in self.recorder])
-        )
+        loss = np.array([0., 0., 0.])
+        for record in self.recorder:
+            loss += self._train(
+                self.strip_reshape(np.array([state.inputs[0] for state in record])),
+                self.strip_reshape(np.array([state.inputs[1] for state in record])),
+                self.strip_reshape(np.array([state.inputs[2] for state in record])),
+                np.array(self.get_discounted_rewards([t.reward for t in record]), dtype=np.float32),
+                np.array([state.ns_action for state in record]),
+                np.array([state.s_action for state in record])
+            )
+        return loss / len(self.recorder)
 
     def _train(self, screens_input, action_input, select_input, reward, action, screen_action):
         _entropy = _policy_loss = _value_loss = 0.
 
-        with tf.GradientTape() as tape:
+        with tf.GradientTape(persistent=True) as tape:
             spatial_policy, ns_policy, value = self.model([screens_input, action_input, select_input])
-            ns_policy = K.softmax(ns_policy)
+            value = K.squeeze(value, axis=1)
 
             ns_action_one_hot = K.one_hot(action, len(self.action_options))
             screen_action_one_hot = K.one_hot(screen_action, self.SCREEN_SIZE * self.SCREEN_SIZE)
 
+            value_loss = 5 * K.square(reward - value)
+
+            entropy = -K.sum(ns_policy * K.log(ns_policy + 1e-10), axis=1) - \
+                       K.sum(spatial_policy * K.log(spatial_policy + 1e-10), axis=1)
+            ns_log_prob = K.log(K.sum(ns_policy * ns_action_one_hot, axis=1))
+            spatial_log_prob = K.log(K.sum(spatial_policy * screen_action_one_hot, axis=1))
             advantage = reward - K.stop_gradient(value)
 
-            entropy = -K.sum(ns_policy * K.log(ns_policy + 1e-10)) - \
-                       K.sum(spatial_policy * K.log(spatial_policy + 1e-10))
-            value_loss = 20 * K.mean(K.square(reward - value))
+            policy_loss = -(ns_log_prob + spatial_log_prob) * advantage - entropy * ENTROPY_RATE
 
-            ns_log_prob = K.log(K.mean(ns_policy * ns_action_one_hot))
-            spatial_log_prob = K.log(K.mean(spatial_policy * screen_action_one_hot))
-            policy_loss = -(ns_log_prob + spatial_log_prob) * advantage
-
-            total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
+            # total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
 
             _entropy = K.mean(entropy)
             _policy_loss = K.mean(K.abs(policy_loss))
             _value_loss = K.mean(value_loss)
 
-        gradients = tape.gradient(total_loss, self.model.trainable_variables)
-        self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
+        value_gradients = tape.gradient(value_loss, self.model.trainable_variables)
+        policy_gradients = tape.gradient(policy_loss, self.model.trainable_variables)
+        del tape  # The tensorflow docs said to do this
+        self.opt.apply_gradients(zip(value_gradients, self.model.trainable_variables))
+        self.opt.apply_gradients(zip(policy_gradients, self.model.trainable_variables))
 
-        return float(_value_loss), float(_policy_loss), float(_entropy)
+        return [float(_value_loss), float(_policy_loss), float(_entropy)]
 
     def strip_reshape(self, arr):
         return np.reshape(arr, tuple(s for s in arr.shape if s > 1))
 
     # Call with game end step and the outcome from the environment
     def step_end(self, obs, outcome):
-        reward = self.calc_reward(obs, self.recorder[-1].obs, outcome=outcome)
-        self.recorder[-1].update(reward)
+        reward = self.calc_reward(obs, self.recorder[self.episode][-1].obs, outcome=outcome)
+        self.recorder[self.episode][-1].update(reward)
 
     # Takes a state and returns an action, also updates step information
     def step(self, obs, training=True):
@@ -208,8 +220,8 @@ class SpicyAgent:
 
         # Calculate reward of previous step and update its state
         if self.steps != 1:
-            reward = self.calc_reward(obs, self.recorder[-1].obs)
-            self.recorder[-1].update(reward)
+            reward = self.calc_reward(obs, self.recorder[self.episode][-1].obs)
+            self.recorder[self.episode][-1].update(reward)
 
         screens_input, action_input, select_input = self.build_inputs_from_obs(obs)
         spatial_action_policy, ns_action_policy, value = self.model([screens_input, action_input, select_input])
@@ -227,25 +239,14 @@ class SpicyAgent:
         screen_x = screen_choice // self.SCREEN_SIZE
         screen_y = screen_choice % self.SCREEN_SIZE
 
-        # Create new array with only weights of available actions
-        action_probs = []
-        available_actions = []
-        for ndx, act_info in enumerate(self.action_options):
-            if act_info['id'] in obs.observation['available_actions']:
-                action_probs.append(ns_action_policy[ndx])
-                available_actions.append((act_info, ndx))
-
-        # Compute softmax with unavailable actions removed, normalize again to get around numpy random choice bug
-        action_probs = np.exp(action_probs) / np.sum(np.exp(action_probs))
-
         if training:
             # Select from probability distribution
-            choice = np.random.choice(len(action_probs), p=action_probs)
+            choice = np.random.choice(len(ns_action_policy), p=ns_action_policy)
         else:
             # Select highest probability
-            choice = int(np.argmax(action_probs))
+            choice = int(np.argmax(ns_action_policy))
 
-        action, real_index = available_actions[choice]
+        action = self.action_options[choice]
         build_args = []
         # Build action
         for arg in action['args']:
@@ -261,16 +262,14 @@ class SpicyAgent:
             else:
                 raise KeyError('Unrecognized function argument: %s' % arg)
 
-        self.recorder.append(
+        self.recorder[self.episode].append(
             State(obs,
                   (screens_input, action_input, select_input),
                   (spatial_action_policy, ns_action_policy, value),
-                  real_index,
+                  choice,
                   screen_choice)
         )
-        # print("Action: %s, Args: %s" % (actions.FUNCTIONS[action['id']].name, build_args))
         return actions.FunctionCall(action['id'], build_args)
-        # return actions.FunctionCall(actions.FUNCTIONS.no_op.id, [])
 
     def build_inputs_from_obs(self, obs):
         screens_input = np.zeros((self.SCREEN_DEPTH, self.SCREEN_SIZE, self.SCREEN_SIZE), dtype=np.float32)
@@ -312,11 +311,6 @@ class SpicyAgent:
         return screens_input, action_input, select_input
 
     def calc_reward(self, obs, obs_prev, outcome=0.):
-        # action_result = obs.observation['action_result']
-        # if action_result == 1:   # Success
-        #     action_reward = .001
-        # else:
-        #     action_reward = -.001
         rw = self.reward_weights
 
         score = obs.observation['score_by_category']
@@ -370,7 +364,9 @@ class SpicyAgent:
         action_policy = Conv2D(1, 3, strides=2, padding='same', activation='relu')(core)
         action_policy = Flatten()(action_policy)
         action_policy = Dense(action_size, use_bias=True, name='Barb')(action_policy)
-        action_policy = Reshape((action_size,))(action_policy)
+        # Mask out unavailable actions and softmax
+        # Someone on stackoverflow said this wasn't numerically stable.  BUT I DIDN'T LISTEN
+        action_policy = K.exp(action_policy) * action_input / (K.sum(K.exp(action_policy) * action_input))
 
         value = Conv2D(1, 5, strides=3)(core)
         value = BatchNormalization()(value)
@@ -378,12 +374,13 @@ class SpicyAgent:
         value = Flatten()(value)
         value = Dense(1)(value)
 
-        # Concat the chosen action policy so screen policy is action aware
-        action_policy_dense = Dense(screen_width*screen_height, use_bias=True, activation='relu')(action_policy)
-        action_policy_dense = Reshape((screen_width, screen_height, 1))(action_policy_dense)
-        screen_core = Concatenate(axis=3)([core, action_policy_dense])
+        # TODO: Concat the chosen action policy so screen policy is action aware
+        # action_policy_dense = Dense(screen_width*screen_height, use_bias=True, activation='relu', name='Grognar')(K.stop_gradient(action_policy))
+        # action_policy_dense = Reshape((screen_width, screen_height, 1))(action_policy_dense)
+        # screen_core = Concatenate(axis=3)([core, action_policy_dense])
 
-        screen_policy = Conv2D(1, 3, padding='same', activation='softmax')(screen_core)
+        screen_policy = Conv2D(2, 3, padding='same', activation='relu')(core)
+        screen_policy = Conv2D(1, 3, padding='same', activation='softmax')(screen_policy)
         screen_policy = Flatten()(screen_policy)
 
         model = Model([screen_input, action_input, select_input], [screen_policy, action_policy, value])

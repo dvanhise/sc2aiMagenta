@@ -12,7 +12,8 @@ from absl import flags
 import matplotlib.pyplot as plt
 
 from pysc2.env import available_actions_printer, sc2_env
-from pysc2.lib import point_flag, stopwatch
+from pysc2.lib import point_flag, stopwatch, actions
+import pysc2
 
 from spicy_agent import SpicyAgent
 from maps import MapCM, MapCMI
@@ -52,12 +53,13 @@ flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
 flags.mark_flag_as_required("map")
 
 AGENT_COUNT = 5
+EPISODES_PER_MATCH = 8
 
 
-def run(players, agents, map_name):
+def run(players, agents):
     """Run one thread worth of the environment with agents."""
     with sc2_env.SC2Env(
-            map_name=map_name,
+            map_name=FLAGS.map,
             battle_net_map=FLAGS.battle_net_map,
             players=players,
             agent_interface_format=sc2_env.parse_agent_interface_format(
@@ -78,7 +80,7 @@ def run(players, agents, map_name):
 
         if FLAGS.mode == 'play':
             agent = random.choice(agents)
-            run_game_loop([agent], env)
+            run_game_loop([agent], env, main_env)
             if FLAGS.save_replay:
                 env.save_replay('./replays/%s_%s-%s_%s.SC2Replay' %
                                 (FLAGS.map, agent.name, 'human', datetime.now().strftime('%Y%m%d%H%M%S')))
@@ -89,30 +91,29 @@ def run(players, agents, map_name):
 
             # Full round robin
             total_time = 0.
-            total_entropy = 0.
-            total_value_loss = 0.
-            total_policy_loss = 0.
+            total_losses = [0., 0., 0.]
             games_played = 0
+            wins = {agent.name: 0 for agent in agents}
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
                 player1.reset()
                 player2.reset()
 
                 print('>>> Start game loop between %s and %s' % (player1.name, player2.name))
                 t_start = time.time()
-                total_time += run_game_loop([player1, player2], env, main_env)
+                elapsed_time, results = run_game_loop([player1, player2], env, main_env)
+                wins[player1.name] += results[0]
+                wins[player2.name] += results[1]
+                total_time += elapsed_time
+
                 print('Game completed in %.2fs' % (time.time() - t_start))
                 games_played += 1
 
                 if FLAGS.mode == 'train':
                     print('>>> Train agents')
                     t_start = time.time()
-                    value_loss, policy_loss, entropy = player1.train()
-                    value_loss2, policy_loss2, entropy2 = player2.train()
+                    total_losses += player1.train()
+                    total_losses += player2.train()
                     print('Training completed in %.2fs' % (time.time() - t_start))
-
-                    total_value_loss += value_loss + value_loss2
-                    total_policy_loss += policy_loss + policy_loss2
-                    total_entropy += entropy + entropy2
 
                 make_reward_plot(player1, save=True)
                 make_reward_plot(player2, save=True)
@@ -123,13 +124,15 @@ def run(players, agents, map_name):
                     env.save_replay('%s_%s-%s_%s.SC2Replay' %
                                     (FLAGS.map, player1.name, player2.name, datetime.now().strftime('%Y%m%d%H%M%S')))
 
-            logging.info('Generation %d complete' % gen)
-            logging.info('Average game time: %.2fs' % (total_time / games_played))
-            logging.info('Average value loss: %.3f' % (total_value_loss / (2*games_played)))
-            logging.info('Average policy loss: %.3f' % (total_policy_loss / (2*games_played)))
-            logging.info('Average entropy: %.3f' % (total_entropy / (2*games_played*total_time)))
-
             if FLAGS.mode == 'train':
+                logging.info('Generation %d complete' % gen)
+                logging.info('Average game time: %.2fs' % (total_time / (EPISODES_PER_MATCH * games_played)))
+                logging.info('Average value loss: %.3f' % (total_losses[0] / (2 * games_played)))
+                logging.info('Average policy loss: %.3f' % (total_losses[1] / (2 * games_played)))
+                logging.info('Average entropy: %.3f' % (total_losses[2] / (2 * games_played)))
+                for name, score in wins.items():
+                    logging.info('%s: %d' % (name, score))
+
                 for agent in agents:
                     agent.model.save_weights('./save/%s.tf' % agent.name)
 
@@ -137,38 +140,48 @@ def run(players, agents, map_name):
 def run_game_loop(agents, env, main_env):
     total_frames = 0
     start_time = time.time()
+    cumulative_results = np.array([0, 0])
 
     states = env.reset()
-    while True:
-        total_frames += 1
-        actions = [agent.step(state, training=(FLAGS.mode == 'train')) for agent, state in zip(agents, states)]
-        states = env.step(actions)
+    for episode in range(EPISODES_PER_MATCH):
+        for a in agents:
+            a.start_episode()
+        while True:
+            total_frames += 1
+            acts = [agent.step(state, training=(FLAGS.mode == 'train')) for agent, state in zip(agents, states)]
+            states = env.step(acts)
 
-        if states[0].last() or states[1].last():
-            # Step one last time to update rewards
-            for agent, state, obs in zip(agents, states, main_env._obs):
-                outcome = 0
-                for result in obs.player_result:
-                    if result.player_id == obs.observation.player_common.player_id:
-                        if result.result == 1:  # Victory
-                            outcome = 1
-                        elif result.result == 2:  # Defeat
-                            outcome = -1
-                        else:
-                            raise ValueError('Invalid game result')
-                        break
-                agent.step_end(state, outcome=outcome)
+            results = check_for_end(states)
+            if results:
+                cumulative_results += np.array(results)
+                for agent, state, result in zip(agents, states, results):
+                    agent.step_end(state, outcome=result)
+                break
 
-            break
+        # Send reset command and run a no op to advance the reset
+        main_env.send_chat_messages(['reset'])
+        states = env.step([actions.FunctionCall(0, []), actions.FunctionCall(0, [])])
 
     elapsed_time = time.time() - start_time
     print("Took %.3f seconds at %.3f fps" % (elapsed_time, total_frames / elapsed_time))
-    return elapsed_time
+    return elapsed_time, cumulative_results
+
+
+def check_for_end(states):
+    if states[0].last() or states[1].last():
+        raise ValueError('Last frame unexpected')
+
+    # Check for one side having no unites
+    if any(state.observation['player'][8] == 0 for state in states):
+        return (-1 if states[0].observation['player'][8] == 0 else 1), \
+               (-1 if states[1].observation['player'][8] == 0 else 1)
+
+    return None
 
 
 def make_action_plot(agent, save=False):
-    action_probs = np.sum([(np.exp(state.outputs[1]) / np.sum(np.exp(state.outputs[1]))) for state in agent.recorder], axis=0)
-    action_probs /= len(agent.recorder)
+    action_probs = np.sum([state.outputs[1] for state in agent.recorder[0]], axis=0)
+    action_probs /= len(agent.recorder[0])
 
     plt.clf()
     plt.plot(range(len(action_probs)), action_probs, 'bo', markersize=2)
@@ -183,14 +196,15 @@ def make_action_plot(agent, save=False):
 
 
 def make_reward_plot(agent, save=False):
-    values = [float(state.outputs[2]) for state in agent.recorder]
-    discounted_rewards = agent.get_discounted_rewards()
-    rewards = [state.reward for state in agent.recorder]
+    episode = agent.recorder[0]
+    values = [float(state.outputs[2]) for state in episode]
+    rewards = [state.reward for state in episode]
+    discounted_rewards = agent.get_discounted_rewards(rewards)
 
     plt.clf()
-    plt.plot(range(len(agent.recorder)), values, 'bo', markersize=2)
-    plt.plot(range(len(agent.recorder)), rewards, 'ro', markersize=2)
-    plt.plot(range(len(agent.recorder)), discounted_rewards, 'go', markersize=2)
+    plt.plot(range(len(episode)), values, 'bo', markersize=2)
+    plt.plot(range(len(episode)), rewards, 'ro', markersize=2)
+    plt.plot(range(len(episode)), discounted_rewards, 'go', markersize=2)
     plt.ylabel('Value/Reward')
     plt.xlabel('Step')
     plt.title('%s Predicted Value and Reward' % agent.name)
@@ -236,12 +250,12 @@ def main(unused_argv):
         sc2_env.Agent(sc2_env.Race['terran'], 'player1'),
         sc2_env.Agent(sc2_env.Race['terran'], 'player2')
     ]
-    run(players, agents, FLAGS.map)
+    run(players, agents)
 
 
 if __name__ == "__main__":
-    absl_logger = logging.getLogger('absl')
-    absl_logger.setLevel(logging.ERROR)
+    logging.getLogger('absl').setLevel(logging.ERROR)
+    logging.getLogger("tensorflow").setLevel(logging.ERROR)
 
     logging.basicConfig(level=logging.INFO, filename='train.log')
 
