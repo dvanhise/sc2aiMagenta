@@ -175,34 +175,33 @@ class SpicyAgent:
     def _train(self, screens_input, action_input, select_input, reward, action, screen_action):
         _entropy = _policy_loss = _value_loss = 0.
 
-        with tf.GradientTape(persistent=True) as tape:
+        with tf.GradientTape() as tape:
             spatial_policy, ns_policy, value = self.model([screens_input, action_input, select_input])
             value = K.squeeze(value, axis=1)
 
             ns_action_one_hot = K.one_hot(action, len(self.action_options))
             screen_action_one_hot = K.one_hot(screen_action, self.SCREEN_SIZE * self.SCREEN_SIZE)
 
-            value_loss = 5 * K.square(reward - value)
+            value_loss = .5 * K.square(reward - value)
 
             entropy = -K.sum(ns_policy * K.log(ns_policy + 1e-10), axis=1) - \
                        K.sum(spatial_policy * K.log(spatial_policy + 1e-10), axis=1)
-            ns_log_prob = K.log(K.sum(ns_policy * ns_action_one_hot, axis=1))
-            spatial_log_prob = K.log(K.sum(spatial_policy * screen_action_one_hot, axis=1))
+            ns_log_prob = K.log(K.sum(ns_policy * ns_action_one_hot, axis=1) + 1e-10)
+            spatial_log_prob = K.log(K.sum(spatial_policy * screen_action_one_hot, axis=1) + 1e-10)
             advantage = reward - K.stop_gradient(value)
 
             policy_loss = -(ns_log_prob + spatial_log_prob) * advantage - entropy * ENTROPY_RATE
 
-            # total_loss = policy_loss + value_loss - entropy * ENTROPY_RATE
+            total_loss = policy_loss + value_loss
 
             _entropy = K.mean(entropy)
             _policy_loss = K.mean(K.abs(policy_loss))
             _value_loss = K.mean(value_loss)
 
-        value_gradients = tape.gradient(value_loss, self.model.trainable_variables)
-        policy_gradients = tape.gradient(policy_loss, self.model.trainable_variables)
-        del tape  # The tensorflow docs said to do this
-        self.opt.apply_gradients(zip(value_gradients, self.model.trainable_variables))
-        self.opt.apply_gradients(zip(policy_gradients, self.model.trainable_variables))
+        gradients = tape.gradient(total_loss, self.model.trainable_variables)
+        # print(tf.linalg.global_norm(gradients))
+        gradients, _ = tf.clip_by_global_norm(gradients, 800.)  # Prevents exploding gradients...I think
+        self.opt.apply_gradients(zip(gradients, self.model.trainable_variables))
 
         return [float(_value_loss), float(_policy_loss), float(_entropy)]
 
@@ -231,8 +230,12 @@ class SpicyAgent:
         ns_action_policy = self.strip_reshape(ns_action_policy)
 
         if training:
-            screen_choice = np.random.choice(self.SCREEN_SIZE * self.SCREEN_SIZE,
-                                             p=spatial_action_policy / np.sum(spatial_action_policy))
+            try:
+                screen_choice = np.random.choice(self.SCREEN_SIZE * self.SCREEN_SIZE,
+                                                 p=spatial_action_policy / np.sum(spatial_action_policy))
+            except Exception as e:
+                print('Error in %s' % self.name)
+                raise
         else:
             screen_choice = np.argmax(spatial_action_policy)
 
@@ -365,7 +368,6 @@ class SpicyAgent:
         action_policy = Flatten()(action_policy)
         action_policy = Dense(action_size, use_bias=True, name='Barb')(action_policy)
         # Mask out unavailable actions and softmax
-        # Someone on stackoverflow said this wasn't numerically stable.  BUT I DIDN'T LISTEN
         action_policy = K.exp(action_policy) * action_input / (K.sum(K.exp(action_policy) * action_input))
 
         value = Conv2D(1, 5, strides=3)(core)
@@ -374,14 +376,14 @@ class SpicyAgent:
         value = Flatten()(value)
         value = Dense(1)(value)
 
-        # TODO: Concat the chosen action policy so screen policy is action aware
-        # action_policy_dense = Dense(screen_width*screen_height, use_bias=True, activation='relu', name='Grognar')(K.stop_gradient(action_policy))
-        # action_policy_dense = Reshape((screen_width, screen_height, 1))(action_policy_dense)
-        # screen_core = Concatenate(axis=3)([core, action_policy_dense])
-
-        screen_policy = Conv2D(2, 3, padding='same', activation='relu')(core)
-        screen_policy = Conv2D(1, 3, padding='same', activation='softmax')(screen_policy)
+        # Concat in the action policy to inform the screen policy
+        action_policy_dense = Dense(screen_width*screen_height, use_bias=True, activation='relu')(K.stop_gradient(action_policy))
+        action_policy_dense = Reshape((screen_width, screen_height, 1))(action_policy_dense)
+        screen_core = Concatenate(axis=3)([core, action_policy_dense])
+        screen_policy = Conv2D(2, 3, padding='same', activation='relu')(screen_core)
+        screen_policy = Conv2D(1, 3, padding='same')(screen_policy)
         screen_policy = Flatten()(screen_policy)
+        screen_policy = Activation('softmax')(screen_policy)
 
         model = Model([screen_input, action_input, select_input], [screen_policy, action_policy, value])
 

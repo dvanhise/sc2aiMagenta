@@ -5,18 +5,20 @@ import logging
 from datetime import datetime
 import random
 import numpy as np
-import yaml
 
 from absl import app
 from absl import flags
 import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import seaborn as sns
 
 from pysc2.env import available_actions_printer, sc2_env
-from pysc2.lib import point_flag, stopwatch, actions
-import pysc2
+from pysc2.lib import actions
+import tensorflow as tf
 
 from spicy_agent import SpicyAgent
-from maps import MapCM, MapCMI
+from spicy_config import *
+from maps import MapCMI
 
 
 FLAGS = flags.FLAGS
@@ -30,14 +32,14 @@ flags.DEFINE_bool("realtime", True, "Whether to run in realtime as opposed to ma
 flags.DEFINE_string("map", "CodeMagentaIsland", "Name of a map to use.")
 flags.DEFINE_bool("save_replay", False, "Whether to save a replay of each game played.")
 
-point_flag.DEFINE_point("feature_screen_size", "64",
-                        "Resolution for screen feature layers.")
-point_flag.DEFINE_point("feature_minimap_size", "64",
-                        "Resolution for minimap feature layers.")
-point_flag.DEFINE_point("rgb_screen_size", None,
-                        "Resolution for rendered screen.")
-point_flag.DEFINE_point("rgb_minimap_size", None,
-                        "Resolution for rendered minimap.")
+flags.DEFINE_integer("feature_screen_size", 64,
+                     "Resolution for screen feature layers.")
+flags.DEFINE_integer("feature_minimap_size", 64,
+                     "Resolution for minimap feature layers.")
+flags.DEFINE_integer("rgb_screen_size", None,
+                     "Resolution for rendered screen.")
+flags.DEFINE_integer("rgb_minimap_size", None,
+                     "Resolution for rendered minimap.")
 flags.DEFINE_enum("action_space", None, sc2_env.ActionSpace._member_names_,  # pylint: disable=protected-access
                   "Which action space to use. Needed if you take both feature "
                   "and rgb observations.")
@@ -51,9 +53,6 @@ flags.DEFINE_integer("game_steps_per_episode", None, "Game steps per episode.")
 
 flags.DEFINE_bool("battle_net_map", False, "Use the battle.net map version.")
 flags.mark_flag_as_required("map")
-
-AGENT_COUNT = 5
-EPISODES_PER_MATCH = 8
 
 
 def run(players, agents):
@@ -115,10 +114,11 @@ def run(players, agents):
                     total_losses += player2.train()
                     print('Training completed in %.2fs' % (time.time() - t_start))
 
-                make_reward_plot(player1, save=True)
-                make_reward_plot(player2, save=True)
-                make_action_plot(player1, save=True)
-                make_action_plot(player2, save=True)
+                for player in [player1, player2]:
+                    make_reward_plot(player, save=True)
+                    make_screen_plot(player, save=True)
+                    make_action_plot(player, save=True)
+                    # make_screen_gif(player, save=True)
 
                 if FLAGS.save_replay:
                     env.save_replay('%s_%s-%s_%s.SC2Replay' %
@@ -135,6 +135,10 @@ def run(players, agents):
 
                 for agent in agents:
                     agent.model.save_weights('./save/%s.tf' % agent.name)
+
+            # Only run for a few generations at a time, after that performance degrades
+            if gen == 2:
+                break
 
 
 def run_game_loop(agents, env, main_env):
@@ -158,7 +162,9 @@ def run_game_loop(agents, env, main_env):
                     agent.step_end(state, outcome=result)
                 break
 
-        # Send reset command and run a no op to advance the reset
+        # Send reset command and run some no ops to advance the reset
+        for _ in range(5):
+            env.step([actions.FunctionCall(0, []), actions.FunctionCall(0, [])])
         main_env.send_chat_messages(['reset'])
         states = env.step([actions.FunctionCall(0, []), actions.FunctionCall(0, [])])
 
@@ -173,8 +179,12 @@ def check_for_end(states):
 
     # Check for one side having no unites
     if any(state.observation['player'][8] == 0 for state in states):
-        return (-1 if states[0].observation['player'][8] == 0 else 1), \
-               (-1 if states[1].observation['player'][8] == 0 else 1)
+        results = ((-1 if states[0].observation['player'][8] == 0 else 1),
+                   (-1 if states[1].observation['player'][8] == 0 else 1))
+        # Assume -1, -1 means a timeout end and give extra penalty
+        if sum(results) == -2:
+            return -2, -2
+        return results
 
     return None
 
@@ -195,6 +205,21 @@ def make_action_plot(agent, save=False):
         plt.show()
 
 
+def make_screen_plot(agent, save=False):
+    screen_probs = np.mean([state.outputs[0] for state in agent.recorder[0]], axis=0)
+    # screen_probs = agent.recorder[0][0].outputs[0]
+    screen_probs = np.reshape(screen_probs, (FLAGS.feature_screen_size, FLAGS.feature_screen_size))
+
+    plt.clf()
+    plt.imshow(screen_probs.T, cmap='viridis')  # Transpose because SC2 switches x and y
+    plt.colorbar()
+    plt.title('%s Screen Location Probabilities' % agent.name)
+    if save:
+        plt.savefig('figures/screen_fig_%s.png' % agent.name)
+    else:
+        plt.show()
+
+
 def make_reward_plot(agent, save=False):
     episode = agent.recorder[0]
     values = [float(state.outputs[2]) for state in episode]
@@ -211,6 +236,36 @@ def make_reward_plot(agent, save=False):
     plt.legend(['Value', 'Reward', 'Discounted Reward'])
     if save:
         plt.savefig('figures/reward_fig_%s.png' % agent.name)
+    else:
+        plt.show()
+
+
+def make_screen_gif(agent, save=False):
+    if len(agent.recorder) == 0:
+        return
+    # Makes of gif of the screen policy probabilities for the first game of the last set
+    game = np.array([np.reshape(frame.outputs[0], (FLAGS.feature_screen_size, FLAGS.feature_screen_size)).T
+                     for frame in agent.recorder[0]])
+
+    vmin = np.amin(game)
+    vmax = np.amax(game)
+    fig = plt.figure()
+    plt.title('%s Screen Policy Probabilities' % agent.name)
+    plt.axis('off')
+    data = game[0]
+    sns.heatmap(data, vmin=vmin, vmax=vmax, square=True, cmap='viridis')
+
+    def init():
+        plt.clf()
+        sns.heatmap(np.zeros((FLAGS.feature_screen_size, FLAGS.feature_screen_size)), vmin=vmin, vmax=vmax, square=True, cmap='viridis')
+
+    def animate(i):
+        plt.clf()
+        sns.heatmap(game[i], vmin=vmin, vmax=vmax, square=True, cmap='viridis')
+
+    anim = animation.FuncAnimation(fig, animate, init_func=init, frames=len(game), repeat=False)
+    if save:
+        anim.save('figures/screen_probs_%s.gif' % agent.name, writer='imagemagick')
     else:
         plt.show()
 
@@ -240,10 +295,10 @@ def main(unused_argv):
         agent = SpicyAgent('agent%d' % i)
         path = './save/%s.tf' % agent.name
         if os.path.exists(path + '.index'):
-            print('Loading from file %s' % path)
+            print('Loading model weights from file %s' % path)
             agent.model.load_weights(path)
         else:
-            print('Could not find file, randomly initilizaing model')
+            print('Could not find saved weights, randomly initilizaing model')
         agents.append(agent)
 
     players = [
@@ -259,10 +314,10 @@ if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO, filename='train.log')
 
+    tf.enable_eager_execution()
+
     # Register maps
-    MapCM()
     MapCMI()
-    globals()['CodeMagenta'] = type('CodeMagenta', (MapCM,), dict(filename='CodeMagenta'))
     globals()['CodeMagentaIsland'] = type('CodeMagentaIsland', (MapCMI,), dict(filename='CodeMagentaIsland'))
 
     app.run(main)
