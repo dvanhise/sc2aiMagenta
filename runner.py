@@ -16,8 +16,8 @@ from pysc2.env import available_actions_printer, sc2_env
 from pysc2.lib import actions
 import tensorflow as tf
 
-from spicy_agent import SpicyAgent
-from spicy_config import *
+from agent import MainAgent
+from config import *
 from maps import MapCMI
 
 
@@ -90,7 +90,7 @@ def run(players, agents):
 
             # Full round robin
             total_time = 0.
-            total_losses = [0., 0., 0.]
+            total_losses = [0., 0., 0., 0.]
             games_played = 0
             wins = {agent.name: 0 for agent in agents}
             for iteration, (player1, player2) in enumerate(combinations(agents, 2)):
@@ -114,11 +114,11 @@ def run(players, agents):
                     total_losses += player2.train()
                     print('Training completed in %.2fs' % (time.time() - t_start))
 
-                for player in [player1, player2]:
-                    make_reward_plot(player, save=True)
-                    make_screen_plot(player, save=True)
-                    make_action_plot(player, save=True)
-                    # make_screen_gif(player, save=True)
+                # for player in [player1, player2]:
+                #     make_reward_plot(player, save=True)
+                #     make_screen_plot(player, save=True)
+                #     make_action_plot(player, save=True)
+                #     # make_screen_gif(player, save=True)
 
                 if FLAGS.save_replay:
                     env.save_replay('%s_%s-%s_%s.SC2Replay' %
@@ -130,6 +130,7 @@ def run(players, agents):
                 logging.info('Average value loss: %.3f' % (total_losses[0] / (2 * games_played)))
                 logging.info('Average policy loss: %.3f' % (total_losses[1] / (2 * games_played)))
                 logging.info('Average entropy: %.3f' % (total_losses[2] / (2 * games_played)))
+                logging.info('Average gradient: %.3f' % (total_losses[3] / (2 * games_played)))
                 for name, score in wins.items():
                     logging.info('%s: %d' % (name, score))
 
@@ -137,7 +138,7 @@ def run(players, agents):
                     agent.model.save_weights('./save/%s.tf' % agent.name)
 
             # Only run for a few generations at a time, after that performance degrades
-            if gen == 2:
+            if gen == 4:
                 break
 
 
@@ -148,8 +149,9 @@ def run_game_loop(agents, env, main_env):
 
     states = env.reset()
     for episode in range(EPISODES_PER_MATCH):
-        for a in agents:
-            a.start_episode()
+        if episode > 0:
+            for a in agents:
+                a.next_episode()
         while True:
             total_frames += 1
             acts = [agent.step(state, training=(FLAGS.mode == 'train')) for agent, state in zip(agents, states)]
@@ -188,62 +190,10 @@ def check_for_end(states):
 
     return None
 
-
-def make_action_plot(agent, save=False):
-    action_probs = np.sum([state.outputs[1] for state in agent.recorder[0]], axis=0)
-    action_probs /= len(agent.recorder[0])
-
-    plt.clf()
-    plt.plot(range(len(action_probs)), action_probs, 'bo', markersize=2)
-    plt.ylabel('Mean Probability')
-    plt.xlabel('Action Index')
-    plt.title('%s Action Probabilities' % agent.name)
-    plt.yscale('log')
-    if save:
-        plt.savefig('figures/action_fig_%s.png' % agent.name)
-    else:
-        plt.show()
-
-
-def make_screen_plot(agent, save=False):
-    screen_probs = np.mean([state.outputs[0] for state in agent.recorder[0]], axis=0)
-    # screen_probs = agent.recorder[0][0].outputs[0]
-    screen_probs = np.reshape(screen_probs, (FLAGS.feature_screen_size, FLAGS.feature_screen_size))
-
-    plt.clf()
-    plt.imshow(screen_probs.T, cmap='viridis')  # Transpose because SC2 switches x and y
-    plt.colorbar()
-    plt.title('%s Screen Location Probabilities' % agent.name)
-    if save:
-        plt.savefig('figures/screen_fig_%s.png' % agent.name)
-    else:
-        plt.show()
-
-
-def make_reward_plot(agent, save=False):
-    episode = agent.recorder[0]
-    values = [float(state.outputs[2]) for state in episode]
-    rewards = [state.reward for state in episode]
-    discounted_rewards = agent.get_discounted_rewards(rewards)
-
-    plt.clf()
-    plt.plot(range(len(episode)), values, 'bo', markersize=2)
-    plt.plot(range(len(episode)), rewards, 'ro', markersize=2)
-    plt.plot(range(len(episode)), discounted_rewards, 'go', markersize=2)
-    plt.ylabel('Value/Reward')
-    plt.xlabel('Step')
-    plt.title('%s Predicted Value and Reward' % agent.name)
-    plt.legend(['Value', 'Reward', 'Discounted Reward'])
-    if save:
-        plt.savefig('figures/reward_fig_%s.png' % agent.name)
-    else:
-        plt.show()
-
-
 def make_screen_gif(agent, save=False):
     if len(agent.recorder) == 0:
         return
-    # Makes of gif of the screen policy probabilities for the first game of the last set
+    # Makes of gif of the screen policy probabilities for the first game of the most recent
     game = np.array([np.reshape(frame.outputs[0], (FLAGS.feature_screen_size, FLAGS.feature_screen_size)).T
                      for frame in agent.recorder[0]])
 
@@ -292,7 +242,7 @@ def main(unused_argv):
     # Initialize agents
     agents = []
     for i in range(AGENT_COUNT):
-        agent = SpicyAgent('agent%d' % i)
+        agent = MainAgent('agent%d' % i)
         path = './save/%s.tf' % agent.name
         if os.path.exists(path + '.index'):
             print('Loading model weights from file %s' % path)

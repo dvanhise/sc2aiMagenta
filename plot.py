@@ -6,6 +6,7 @@ game_time = []
 entropy = []
 policy = []
 value = []
+gradients = []
 
 numbers = re.compile(r'-?\d+(?:\.\d+)?')
 
@@ -24,6 +25,9 @@ with open('train.log', 'r') as f:
         elif 'Average entropy' in line:
             val = numbers.findall(line)[0]
             entropy.append(float(val))
+        elif 'Average gradient' in line:
+            val = numbers.findall(line)[0]
+            gradients.append(float(val))
 
 plt.plot(range(len(game_time)), game_time, 'bo')
 plt.ylabel('Mean Episode Time')
@@ -32,6 +36,12 @@ plt.title('Episode Time')
 plt.show()
 
 plt.plot(range(len(entropy)), [-e for e in entropy], 'bo')
+plt.ylabel('Gradient')
+plt.xlabel('Generation')
+plt.title('Gradients')
+plt.show()
+
+plt.plot(range(len(entropy)), [e for e in entropy], 'bo')
 plt.ylabel('Mean Entropy')
 plt.xlabel('Generation')
 plt.title('Entropy')
